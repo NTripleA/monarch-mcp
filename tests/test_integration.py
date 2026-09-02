@@ -1,36 +1,34 @@
 """Integration tests that verify actual Monarch Money API connectivity.
 
-These tests require valid credentials and are skipped by default.
+These hit the live Monarch API and perform real login attempts, so they require an
+explicit opt-in as well as credentials. Without MONARCH_RUN_INTEGRATION=1 they are
+skipped even when a .env file is present -- otherwise a plain `uv run pytest` (or
+scripts/ci.py) silently fires login attempts, and repeated failures escalate Monarch's
+CAPTCHA gate.
+
+Credentials must be supplied through the environment; this module deliberately does
+not read .env (server.py does that, at its entry point only).
 
 To run integration tests:
-    # Set up .env file with credentials, then:
-    uv run pytest tests/test_integration.py -v
+    MONARCH_RUN_INTEGRATION=1 MONARCH_EMAIL=... MONARCH_PASSWORD=... \
+        uv run pytest tests/test_integration.py -v
 
-Or set environment variables directly:
-    MONARCH_EMAIL=... MONARCH_PASSWORD=... MONARCH_MFA_SECRET=... uv run pytest tests/test_integration.py -v
+Or source your .env explicitly first:
+    set -a; source .env; set +a
+    MONARCH_RUN_INTEGRATION=1 uv run pytest tests/test_integration.py -v
 """
 
 import os
-from pathlib import Path
 
 import pytest
 import pytest_asyncio
-
-# Load .env file if it exists (for local development)
-env_file = Path(__file__).parent.parent / ".env"
-if env_file.exists():
-    with open(env_file) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, _, value = line.partition("=")
-                value = value.strip().strip('"').strip("'")
-                if key.strip() not in os.environ:  # Don't override existing env vars
-                    os.environ[key.strip()] = value
-
 from monarchmoney import MonarchMoney
 
-# Skip all tests in this module if credentials aren't available
+# Skip unless explicitly opted in AND credentials are available. These tests do not
+# read .env -- only the server entry point does -- so credentials must be passed
+# explicitly, and the opt-in flag is required on top of that.
+INTEGRATION_ENABLED = os.environ.get("MONARCH_RUN_INTEGRATION") == "1"
+
 CREDENTIALS_AVAILABLE = all(
     [
         os.environ.get("MONARCH_EMAIL"),
@@ -38,9 +36,14 @@ CREDENTIALS_AVAILABLE = all(
     ]
 )
 
-pytestmark = pytest.mark.skipif(
-    not CREDENTIALS_AVAILABLE, reason="Monarch Money credentials not available (set MONARCH_EMAIL and MONARCH_PASSWORD)"
-)
+if not INTEGRATION_ENABLED:
+    SKIP_REASON = "Live-API tests are opt-in: set MONARCH_RUN_INTEGRATION=1 to run them"
+elif not CREDENTIALS_AVAILABLE:
+    SKIP_REASON = "Monarch Money credentials not available (set MONARCH_EMAIL and MONARCH_PASSWORD)"
+else:
+    SKIP_REASON = ""
+
+pytestmark = pytest.mark.skipif(bool(SKIP_REASON), reason=SKIP_REASON)
 
 
 @pytest_asyncio.fixture

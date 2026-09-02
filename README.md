@@ -21,11 +21,14 @@ Built on the [`monarchmoneycommunity`](https://github.com/bradleyseanf/monarchmo
 
 ## Setup
 
-**One-line install, no clone, no absolute-path wrangling.** The server is published to [PyPI](https://pypi.org/project/monarch-mcp-jamiew/), so [`uv`](https://docs.astral.sh/uv/) runs it on demand with `uvx monarch-mcp-jamiew`. You'll need `uv` installed and your Monarch credentials (see [Getting your MFA secret](#getting-your-mfa-secret) below).
+**One-line install, no clone, no absolute-path wrangling.** The server is published to [PyPI](https://pypi.org/project/monarch-mcp-jamiew/), so [`uv`](https://docs.astral.sh/uv/) runs it on demand with `uvx monarch-mcp-jamiew`. You'll need `uv` installed and your Monarch credentials.
+
+> [!IMPORTANT]
+> **Monarch now puts programmatic email/password login behind Cloudflare bot protection.** When it triggers, login fails with a misleading `"Your code was invalid, please try again or use a recovery token."` — even when your MFA code is provably correct. If you hit that, use [session cookies](#getting-your-session-cookies) instead of a password; it's the reliable path as of August 2026. Cookies are a one-time seed — once the session is cached, they aren't read again until it expires.
 
 ### Standard config
 
-Every MCP client uses the same shape — command `uvx`, package `monarch-mcp-jamiew`, and your three credentials as env vars:
+Every MCP client uses the same shape — command `uvx`, package `monarch-mcp-jamiew`, and your credentials as env vars:
 
 ```json
 {
@@ -40,6 +43,14 @@ Every MCP client uses the same shape — command `uvx`, package `monarch-mcp-jam
       }
     }
   }
+}
+```
+
+If password login is blocked by Cloudflare (see the note above), swap those three for a single `MONARCH_COOKIES` value instead:
+
+```json
+"env": {
+  "MONARCH_COOKIES": "session_id=...; csrftoken=...; cf_clearance=...; __cf_bm=..."
 }
 ```
 
@@ -133,7 +144,7 @@ Most accept the same [standard config](#standard-config) — drop it into the cl
 
 Not sure how? Tell your agent:
 
-> Install the Monarch Money MCP server from https://github.com/jamiew/monarch-mcp — it's on PyPI as `monarch-mcp-jamiew`, runs via `uvx monarch-mcp-jamiew`, and needs env vars `MONARCH_EMAIL`, `MONARCH_PASSWORD`, and `MONARCH_MFA_SECRET`.
+> Install the Monarch Money MCP server from https://github.com/jamiew/monarch-mcp — it's on PyPI as `monarch-mcp-jamiew`, runs via `uvx monarch-mcp-jamiew`, and needs env vars `MONARCH_EMAIL`, `MONARCH_PASSWORD`, and `MONARCH_MFA_SECRET` — or a single `MONARCH_COOKIES` value if password login is blocked by Cloudflare.
 
 </details>
 
@@ -177,6 +188,31 @@ Then point your client at the local copy with absolute paths (find them with `wh
 2. When shown the QR code, look for "Can't scan?" or "Enter manually"
 3. Copy the secret key (a string like `T5SPVJIBRNPNNINFSH5W7RFVF2XYADYX`)
 4. Use this as your `MONARCH_MFA_SECRET`
+
+### Reconnecting from your assistant
+
+The quickest fix when a session expires is to ask your assistant to run the **`authenticate_browser_session`** tool (or just say "reconnect Monarch"). It opens a local page that either detects your Monarch session automatically or accepts a pasted Cookie header, then saves the session — no config editing, no restart.
+
+Your session goes from the browser straight into `~/.monarch-mcp/session.pickle`; it never passes through the assistant's context. Automatic detection needs the optional extra:
+
+```bash
+uvx --with 'monarch-mcp-jamiew[browser]' monarch-mcp-jamiew
+```
+
+Without it the tool still works — it just asks you to paste instead. Auth failures also point the assistant at this tool, so an expired session tends to fix itself with one prompt.
+
+### Getting your session cookies
+
+Use this for first-time setup, or when you'd rather configure cookies directly than use the tool above. You are copying the credentials your browser already uses, so no login attempt is made:
+
+1. Log in at [app.monarch.com](https://app.monarch.com) and keep the tab open
+2. Open DevTools → **Network**, filter for `graphql`, and click any request to `api.monarch.com`
+3. Under **Request Headers**, find the `Cookie` header (toggle **Raw** to make it copyable)
+4. Copy the **entire** value and use it as `MONARCH_COOKIES`
+
+Copy the whole header, not just a couple of pairs. Alongside `session_id` and `csrftoken` it carries Cloudflare's clearance cookies (`cf_clearance`, `__cf_bm`), and those are exactly what a plain API client lacks — a request with only the first two is rejected.
+
+Treat this string like a password: it grants full account access until the session expires.
 
 ## Tools
 
@@ -229,6 +265,7 @@ Sessions are cached in `~/.monarch-mcp/` for faster subsequent logins (override 
 - Delete `~/.monarch-mcp/session.pickle` to clear the cached session
 - Set `MONARCH_FORCE_LOGIN=true` in your env config to force a fresh login
 - Make sure your system clock is accurate (required for TOTP)
+- If login fails with "Your code was invalid" or a CAPTCHA error, the problem is Cloudflare, not your MFA code — re-seed with fresh [session cookies](#getting-your-session-cookies)
 
 ## Development
 
@@ -240,7 +277,12 @@ Create a `.env` file (git-ignored):
 MONARCH_EMAIL="your-email@example.com"
 MONARCH_PASSWORD="your-password"
 MONARCH_MFA_SECRET="YOUR_TOTP_SECRET_KEY"
+
+# Or, if password login is Cloudflare-blocked:
+MONARCH_COOKIES="session_id=...; csrftoken=...; cf_clearance=...; __cf_bm=..."
 ```
+
+`.env` is read by the server entry point only, and real environment variables always take precedence over it.
 
 ### Tests
 

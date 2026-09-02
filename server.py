@@ -14,6 +14,7 @@ import sys
 import time
 import uuid
 import warnings
+import webbrowser
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
 from enum import Enum
@@ -32,8 +33,11 @@ from mcp.types import (
     ResourceTemplateReference,
     ToolAnnotations,
 )
-from monarchmoney import MonarchMoney, RequireMFAException
+from monarchmoney import CaptchaRequiredException, MonarchMoney, RequireMFAException
 from pydantic import BaseModel, ConfigDict, JsonValue
+from structlog.typing import EventDict, WrappedLogger
+
+import browser_auth
 
 # Type definitions for Monarch Money API responses
 JsonSerializable = str | int | float | bool | None | list["JsonSerializable"] | dict[str, "JsonSerializable"]
@@ -395,6 +399,56 @@ logging.basicConfig(
     handlers=[SafeStreamHandler(sys.stderr)],
 )
 
+# Redaction of credentials from every log line. Applied as a structlog processor so it
+# covers all existing call sites and any added later. Temporary TOTP codes are not
+# redacted -- they expire in 30s and are needed for MFA debugging.
+_REDACTED = "<redacted>"
+
+_SENSITIVE_KEYS = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "csrftoken",
+        "email",
+        "key",
+        "passwd",
+        "password",
+        "secret",
+        "session_id",
+        "token",
+        "username",
+    }
+)
+
+_SENSITIVE_SUFFIXES = ("_email", "_key", "_password", "_secret", "_token", "_username")
+
+_EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def _is_sensitive_key(key: str) -> bool:
+    lowered = key.lower()
+    return lowered in _SENSITIVE_KEYS or lowered.endswith(_SENSITIVE_SUFFIXES)
+
+
+def _scrub(value: JsonSerializable) -> JsonSerializable:
+    """Mask email addresses embedded in free-text values (error strings, messages)."""
+    if isinstance(value, str):
+        return _EMAIL_PATTERN.sub(_REDACTED, value)
+    if isinstance(value, dict):
+        return {k: (_REDACTED if _is_sensitive_key(k) and isinstance(v, str) else _scrub(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_scrub(item) for item in value]
+    return value
+
+
+def redact_sensitive(_logger: WrappedLogger, _method_name: str, event_dict: EventDict) -> EventDict:
+    """structlog processor: drop credentials before anything is rendered."""
+    return {
+        key: (_REDACTED if _is_sensitive_key(key) and isinstance(value, str) else _scrub(value))
+        for key, value in event_dict.items()
+    }
+
+
 # Configure structured logging
 structlog.configure(
     processors=[
@@ -405,6 +459,7 @@ structlog.configure(
         structlog.processors.StackInfoRenderer(),
         structlog.processors.format_exc_info,
         structlog.processors.UnicodeDecoder(),
+        redact_sensitive,
         structlog.processors.JSONRenderer(),
     ],
     context_class=dict,
@@ -652,6 +707,15 @@ class CreateAccountResult(MMModel):
 
 class RefreshResult(MMModel):
     result: JsonValue
+
+
+class BrowserAuthResult(MMModel):
+    """Outcome of a browser sign-in. Deliberately carries no credential fields --
+    captured cookies must never reach structured output or the model context."""
+
+    authenticated: bool
+    method: str
+    message: str
 
 
 class Totals(BaseModel):
@@ -1112,6 +1176,120 @@ async def api_call_with_retry(method_name: str, *args: Any, max_retries: int = 3
     raise RuntimeError("api_call_with_retry completed without result or error")
 
 
+# A TOTP code is single-use and valid for one 30s window.
+TOTP_PERIOD_SECONDS = 30
+
+BROWSER_AUTH_HINT = "Call the authenticate_browser_session tool to sign in through your browser."
+
+CAPTCHA_GUIDANCE = (
+    "Monarch is requiring a CAPTCHA for programmatic login, so email/password/MFA "
+    "authentication cannot succeed. Each further attempt escalates the block. "
+    "Authenticate with a browser session instead. " + BROWSER_AUTH_HINT + " "
+    "Alternatively set MONARCH_COOKIES to the full Cookie header from a logged-in "
+    "app.monarch.com session (it must include session_id, csrftoken, and cf_clearance)."
+)
+
+
+def is_captcha_error(error: Exception) -> bool:
+    """Detect Monarch's CAPTCHA gate.
+
+    The library only raises CaptchaRequiredException on HTTP 403, but Monarch also
+    signals the gate with HTTP 429 + error_code CAPTCHA_REQUIRED, which arrives as a
+    generic LoginFailedException. Match on the message so both forms are caught.
+    """
+    return isinstance(error, CaptchaRequiredException) or "captcha" in str(error).lower()
+
+
+def seconds_until_retry(default_delay: int, uses_mfa: bool) -> float:
+    """How long to wait before retrying a failed login.
+
+    A TOTP code is single-use within its 30-second window, so retrying sooner just
+    replays a code Monarch has already consumed -- guaranteeing a second "invalid code"
+    failure. When MFA is in play, wait for the next window so the retry gets a fresh code.
+    """
+    if not uses_mfa:
+        return float(default_delay)
+    return TOTP_PERIOD_SECONDS - (time.time() % TOTP_PERIOD_SECONDS) + 1.0
+
+
+async def authenticate_with_token(token: str) -> None:
+    """Authenticate with a Monarch API token copied from a browser session.
+
+    Monarch's GraphQL API uses token authentication -- it rejects session cookies with
+    "Authentication credentials were not provided" -- so this is the reliable way in when
+    programmatic password login is CAPTCHA-gated. The token is taken from the
+    Authorization header of any app.monarch.com GraphQL request.
+    """
+    global mm_client, auth_state, auth_error, auth_failed_at
+
+    # MonarchMoney() sets the Authorization header only via its constructor; set_token()
+    # alone would leave the header unset.
+    mm_client = MonarchMoney(token=token)
+
+    try:
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+            await mm_client.get_accounts()
+            mm_client.save_session(str(session_file))
+
+        if session_file.exists():
+            session_file.chmod(0o600)
+
+        auth_state = AuthState.AUTHENTICATED
+        auth_error = None
+        log.info("auth_success", method="token")
+
+    except Exception as e:
+        error_msg = (
+            f"Token authentication failed: {e}. Copy a fresh value from the Authorization "
+            "header of a GraphQL request in a logged-in app.monarch.com session "
+            "(the part after 'Token ')."
+        )
+        log.error("auth_token_failed", error=str(e))
+        auth_state = AuthState.FAILED
+        auth_error = error_msg
+        auth_failed_at = time.time()
+        raise ValueError(error_msg) from e
+
+
+async def authenticate_with_cookies(cookie_string: str) -> None:
+    """Authenticate with browser session cookies, bypassing /auth/login/ entirely.
+
+    Monarch CAPTCHA-gates programmatic password login; cookie auth is the supported
+    way around that. Requires session_id and csrftoken from a logged-in browser.
+    """
+    global auth_state, auth_error, auth_failed_at
+
+    if mm_client is None:
+        raise RuntimeError("authenticate_with_cookies called before the client was created")
+
+    try:
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+        with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+            await mm_client.login_with_cookies(cookie_string, save_session=False)
+            mm_client.save_session(str(session_file))
+
+        if session_file.exists():
+            session_file.chmod(0o600)
+
+        auth_state = AuthState.AUTHENTICATED
+        auth_error = None
+        log.info("auth_success", method="cookies")
+
+    except Exception as e:
+        error_msg = (
+            f"Cookie authentication failed: {e}. Cookies expire -- copy fresh session_id "
+            "and csrftoken values from a logged-in app.monarch.com session."
+        )
+        log.error("auth_cookie_failed", error=str(e))
+        auth_state = AuthState.FAILED
+        auth_error = error_msg
+        auth_failed_at = time.time()
+        raise ValueError(error_msg) from e
+
+
 async def initialize_client() -> None:
     """Initialize the MonarchMoney client with authentication.
 
@@ -1124,19 +1302,42 @@ async def initialize_client() -> None:
     email = os.getenv("MONARCH_EMAIL")
     password = os.getenv("MONARCH_PASSWORD")
     mfa_secret = os.getenv("MONARCH_MFA_SECRET")
+    cookies = os.getenv("MONARCH_COOKIES")
+    token = os.getenv("MONARCH_TOKEN")
 
-    if not email or not password:
-        error_msg = "MONARCH_EMAIL and MONARCH_PASSWORD environment variables are required"
+    if not token and not cookies and (not email or not password):
+        error_msg = (
+            "MONARCH_EMAIL and MONARCH_PASSWORD environment variables are required "
+            "(or set MONARCH_TOKEN, or MONARCH_COOKIES, to reuse a browser session)"
+        )
         log.error("auth_missing_credentials")
         auth_state = AuthState.FAILED
         auth_error = error_msg
         raise ValueError(error_msg)
 
-    log.info("auth_init", email=email)
+    auth_method = "token" if token else "cookies" if cookies else "password"
+    log.info("auth_init", email=email, method=auth_method)
+
+    # Optional MFA/TOTP tracing, off unless MONARCH_DEBUG_MFA=true. debug_mfa.py is a
+    # local-only tool (gitignored), so treat it as absent rather than required.
+    if os.getenv("MONARCH_DEBUG_MFA", "").lower() == "true":
+        try:
+            import debug_mfa
+
+            debug_mfa.enable()
+        except ImportError:
+            log.warning("auth_debug_mfa_unavailable", reason="debug_mfa.py not present")
+
+    # clear_session() resets mm_client to None, so every call to it must happen before
+    # the client is constructed -- or the client must be rebuilt afterwards.
+    force_login = os.getenv("MONARCH_FORCE_LOGIN") == "true"
+    if force_login:
+        log.info("auth_force_login")
+        clear_session(reason="forced login requested")
+
     mm_client = MonarchMoney()
 
     # Try to load existing session first (unless forced to skip)
-    force_login = os.getenv("MONARCH_FORCE_LOGIN") == "true"
     if session_file.exists() and not force_login:
         try:
             stdout_capture = io.StringIO()
@@ -1152,11 +1353,16 @@ async def initialize_client() -> None:
             log.warning("auth_session_load_failed", error=str(e))
             if is_auth_error(e):
                 clear_session(reason="invalid session file")
+                mm_client = MonarchMoney()
 
-    else:
-        if force_login:
-            log.info("auth_force_login")
-            clear_session(reason="forced login requested")
+    # Token first: it is the only browser-derived credential Monarch's GraphQL API accepts.
+    if token:
+        await authenticate_with_token(token)
+        return
+
+    if cookies:
+        await authenticate_with_cookies(cookies)
+        return
 
     # Perform fresh authentication
     max_retries = 2
@@ -1192,11 +1398,20 @@ async def initialize_client() -> None:
             raise ValueError(error_msg) from e
 
         except Exception as e:
+            # Retrying a CAPTCHA gate cannot succeed and escalates the block.
+            if is_captcha_error(e):
+                log.error("auth_captcha_required", error=str(e))
+                auth_state = AuthState.FAILED
+                auth_error = CAPTCHA_GUIDANCE
+                auth_failed_at = time.time()
+                raise ValueError(CAPTCHA_GUIDANCE) from e
+
             if attempt < max_retries - 1:
                 log.warning("auth_attempt_failed", attempt=attempt + 1, error=str(e), is_auth=is_auth_error(e))
                 if is_auth_error(e):
                     clear_session(reason=f"auth failure on attempt {attempt + 1}")
-                await asyncio.sleep(retry_delay)
+                    mm_client = MonarchMoney()
+                await asyncio.sleep(seconds_until_retry(retry_delay, bool(mfa_secret)))
             else:
                 error_msg = f"Authentication failed after {max_retries} attempts: {e}"
                 log.error("auth_failed", error=str(e), max_retries=max_retries)
@@ -1242,7 +1457,7 @@ async def ensure_authenticated() -> None:
                     error_msg = (
                         f"Authentication previously failed: {auth_error or 'unknown error'}. "
                         f"Cooldown active: retry available in {remaining:.0f} seconds. "
-                        f"To retry immediately, restart the server or set MONARCH_FORCE_LOGIN=true."
+                        f"{BROWSER_AUTH_HINT} It bypasses the cooldown by seeding a fresh session."
                     )
                     raise ValueError(error_msg)
                 else:
@@ -2247,6 +2462,87 @@ async def refresh_accounts() -> RefreshResult:
         raise
 
 
+ELICIT_MESSAGE = (
+    "Sign in to Monarch Money in your browser to reconnect this server. "
+    "Your session is captured locally and never passes through the assistant."
+)
+
+
+@mcp.tool(annotations=WRITE_SIDE_EFFECT, title="Sign In With Browser")
+@track_usage
+async def authenticate_browser_session(ctx: Context | None = None) -> BrowserAuthResult:
+    """Sign in to Monarch Money using your browser, then save the session.
+
+    Use this when authentication has failed, especially with a CAPTCHA error or a
+    misleading "Your code was invalid" message -- Monarch blocks programmatic password
+    login, so reusing a browser session is the reliable path.
+
+    Opens a local page that either detects your Monarch session automatically or accepts
+    a pasted Cookie header. Credentials go from the browser straight into the session
+    file; they are never returned by this tool.
+    """
+    global mm_client
+
+    timeout = float(os.getenv("MONARCH_BROWSER_AUTH_TIMEOUT", "300"))
+    capture = browser_auth.CookieCaptureServer()
+    url = await capture.start()
+    elicitation_id = str(uuid.uuid4())
+    elicited = False
+
+    try:
+        if ctx is not None:
+            try:
+                outcome = await ctx.elicit_url(message=ELICIT_MESSAGE, url=url, elicitation_id=elicitation_id)
+                elicited = True
+                action = getattr(outcome, "action", "accept")
+                if action != "accept":
+                    log.info("browser_auth_declined", action=action)
+                    return BrowserAuthResult(
+                        authenticated=False,
+                        method=action,
+                        message=f"Browser sign-in was {action}ed. Nothing was changed.",
+                    )
+            except Exception as e:
+                # Client does not support URL elicitation -- open the browser ourselves.
+                log.warning("browser_auth_elicitation_unavailable", error=str(e))
+
+        if not elicited:
+            opened = webbrowser.open(url)
+            log.info("browser_auth_opened_directly", opened=opened)
+
+        cookie_string, method = await capture.wait(timeout)
+
+        if mm_client is None:
+            mm_client = MonarchMoney()
+        await authenticate_with_cookies(cookie_string)
+
+        if elicited and ctx is not None:
+            try:
+                await ctx.session.send_elicit_complete(elicitation_id)
+            except Exception as e:
+                log.warning("browser_auth_complete_notify_failed", error=str(e))
+
+        log.info("browser_auth_success", method=method)
+        return BrowserAuthResult(
+            authenticated=True,
+            method=method,
+            message=f"Signed in and saved the session ({method}). Monarch tools are ready to use.",
+        )
+
+    except (TimeoutError, asyncio.TimeoutError):
+        log.warning("browser_auth_timed_out", timeout_s=timeout)
+        return BrowserAuthResult(
+            authenticated=False,
+            method="timeout",
+            message=(
+                f"Timed out after {timeout:.0f}s waiting for browser sign-in. "
+                f"Run the tool again, or open this link within the time limit: {url}"
+            ),
+        )
+    finally:
+        await capture.stop()
+
+
 @mcp.tool(annotations=READONLY, title="Complete Financial Overview")
 @track_usage
 async def get_complete_financial_overview(period: str = "this month", ctx: Context | None = None) -> FinancialOverview:
@@ -2524,12 +2820,44 @@ async def analyze_spending_patterns(
         raise
 
 
+def load_env_file(env_path: Path | None = None) -> int:
+    """Load KEY=value pairs from a .env file into the environment.
+
+    Called from the server entry points only -- never at import time -- so that
+    importing this module (as the test suite does) has no side effects on the
+    environment. Real environment variables always win over .env values.
+
+    Returns the number of variables loaded.
+    """
+    path = env_path if env_path is not None else Path(__file__).parent / ".env"
+    if not path.exists():
+        return 0
+
+    loaded = 0
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.removeprefix("export ").partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key not in os.environ:
+            os.environ[key] = value
+            loaded += 1
+
+    log.info("env_file_loaded", path=str(path), variables=loaded)
+    return loaded
+
+
 async def main() -> None:
     """Main entry point for the server.
 
     The server starts immediately without authentication. Authentication
     happens lazily on the first tool call via ensure_authenticated().
     """
+    load_env_file()
     log.info("server_starting", session_file=str(session_file), auth_state=auth_state.value)
 
     try:

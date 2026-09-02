@@ -171,7 +171,7 @@ refactor: split server.py into modular components (auth, tools, models)
 - Structured logging with `structlog` for debugging
 - Environment variables: `MONARCH_EMAIL`, `MONARCH_PASSWORD`, `MONARCH_MFA_SECRET`
 
-**Complete Monarch Money API Coverage (21 Tools)**
+**Complete Monarch Money API Coverage (22 Tools)**
 - **Core**: `get_accounts`, `get_transactions`, `get_budgets`, `get_cashflow`
 - **Categories**: `get_transaction_categories`
 - **Transactions**: `create_transaction`, `update_transaction`, `update_transactions_bulk`, `search_transactions`
@@ -180,6 +180,7 @@ refactor: split server.py into modular components (auth, tools, models)
 - **Banking**: `get_institutions`, `refresh_accounts`
 - **Planning**: `get_recurring_transactions`, `set_budget_amount`
 - **Manual**: `create_manual_account`
+- **Auth**: `authenticate_browser_session` (browser sign-in via MCP `elicit_url`; captures cookies on a one-shot loopback server and re-seeds the session)
 - **Batch Operations**: `get_spending_summary`, `update_transactions_bulk`
 - **Intelligent Analysis**: `get_complete_financial_overview`, `analyze_spending_patterns`
 
@@ -235,6 +236,49 @@ Server runs as MCP server configured in `.mcp.json` with:
 ### Releasing & Publishing
 
 Published to PyPI as `monarch-mcp-jamiew` and to the MCP Registry as `io.github.jamiew/monarch-mcp`. Users install via `uvx monarch-mcp-jamiew` (no clone) — so the `[project.scripts]` `monarch-mcp-jamiew = "server:run"` entry point must stay a *synchronous* wrapper (`run()`), never the async `main()` directly, or `uvx` launches a coroutine that's never awaited. Release flow: `/release` bumps `pyproject.toml`, tags `vX.Y.Z`, and `gh release create`s; the `release: published` event triggers `.github/workflows/publish.yml`, which publishes to both PyPI and the registry via **OIDC trusted publishing — no tokens stored**. The workflow sets `server.json`'s version from the tag, so `pyproject.toml` is the only manual version bump. Note: `[tool.uv.sources]`'s git pin of `monarchmoneycommunity` is dev-only and is *not* in the published wheel — PyPI installs resolve the `>=1.3.2` floor from `pyproject.toml` dependencies.
+
+### Authentication Paths (Updated August 2026)
+
+Three ways in, tried in this order by `initialize_client()`:
+
+1. **Token auth** — set `MONARCH_TOKEN` to the value after `Token ` in the
+   `Authorization` header of a GraphQL request from a logged-in app.monarch.com session.
+   Note that Monarch's web client does not always send that header (it may authenticate
+   by cookie instead), so this path is only available when a token is actually present.
+2. **Cookie auth (confirmed working 2026-08-22)** — `MONARCH_COOKIES` set to a full
+   browser `Cookie` header string, copied from a GraphQL request in DevTools. Supply the
+   **whole** header, not just `session_id` + `csrftoken`: the Cloudflare clearance
+   cookies (`cf_clearance`, `__cf_bm`) are what the plain API client lacks. Two pairs
+   alone are rejected with `{"detail": "Authentication credentials were not provided."}`.
+   The `X-Csrftoken` header is also required — cookies without it fail with
+   `{"detail": "CSRF Failed: CSRF token missing."}` — but `set_cookies()` sets it for you.
+   Cookies are a one-time seed: after a successful login the token is persisted to the
+   session file and reused, so `MONARCH_COOKIES` is only re-read when the session dies.
+3. **Password + MFA** — `MONARCH_EMAIL` / `MONARCH_PASSWORD` / `MONARCH_MFA_SECRET`.
+
+The `authenticate_browser_session` tool (see `browser_auth.py`) re-seeds a session at
+runtime without restarting: it starts a single-use loopback server, asks the client to
+open it via `Context.elicit_url` (falling back to `webbrowser.open` when the client has no
+elicitation support), auto-detects cookies via the optional `browser` extra or accepts a
+paste, then reuses `authenticate_with_cookies()`. Cookies never enter tool arguments,
+tool results, or the model context. Auth failures reference the tool via
+`BROWSER_AUTH_HINT` so an agent can recover on its own.
+
+`.env` is loaded by `load_env_file()` from the server entry points only, never at import
+time, so importing `server` in tests has no environment side effects. Real environment
+variables always win over `.env`. Integration tests do not read `.env` and additionally
+require `MONARCH_RUN_INTEGRATION=1`.
+
+**Monarch CAPTCHA-gates programmatic password login.** Verified-correct TOTP codes are
+rejected with a misleading `404 {"detail": "Your code was invalid..."}`; escalating
+retries eventually produce `429 {"error_code": "CAPTCHA_REQUIRED"}`. The library only
+raises `CaptchaRequiredException` on HTTP 403, so the 429 form arrives as a generic
+`LoginFailedException` — `is_captcha_error()` matches on the message to catch both, and
+aborts without retrying (retries escalate the block). If MFA login fails, check for
+CAPTCHA before suspecting the TOTP code; cookie auth is the reliable path.
+
+TOTP codes are single-use per 30s window, so `seconds_until_retry()` waits for the next
+window before an MFA retry rather than replaying a code Monarch has already consumed.
 
 ### Session Management
 

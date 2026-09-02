@@ -76,3 +76,6 @@ logs.sh
 
 # MCP Registry
 .mcpregistry_*
+
+# Local auth-debugging tools (kept out of the repo; inert unless MONARCH_DEBUG_MFA=true)
+debug_*.py
