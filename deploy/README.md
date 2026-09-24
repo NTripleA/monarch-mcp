@@ -1,12 +1,12 @@
 # Remote deployment: Raspberry Pi behind Cloudflare Access
 
-This runs monarch-mcp as a remote MCP server that both Claude and ChatGPT reach through a single connector:
+This runs monarch-mcp as a remote MCP server that both Claude and ChatGPT reach through a single connector. Replace `monarch.example.com` and `mcp-pi` below with your own hostname and SSH/tunnel target in your private deployment configuration:
 
 ```
 Claude / ChatGPT connector
-  └─ https://monarch.ntriplealab.com/mcp
+  └─ https://monarch.example.com/mcp
        └─ Cloudflare Access (Managed OAuth; "Protect with Access")
-            └─ Cloudflare Tunnel "ntriplealab-pi"
+            └─ Cloudflare Tunnel "mcp-pi"
                  └─ Raspberry Pi: HTTP 127.0.0.1:8004   (host loopback only)
                       └─ Docker container "monarch-mcp": 0.0.0.0:8000/mcp  (uid 10001, read-only rootfs)
                            └─ /state/session.pickle     (bind mount of /opt/mcp/monarch/state)
@@ -21,7 +21,7 @@ Cloudflare Access is the only authentication layer; there is no second bearer to
 | Who can connect | Cloudflare Access policy. Nothing listens on a public interface. |
 | DNS rebinding / Host spoofing | `/mcp` accepts only loopback hosts plus `MONARCH_ALLOWED_HOSTS`. Any other Host header gets 421, and a foreign browser Origin gets 403. |
 | Accidental writes | `MONARCH_ENABLE_WRITES` defaults to `false` in HTTP mode. Write tools are left out of `tools/list` **and** rejected if a client with a cached tool list calls them anyway. |
-| Credentials on the Pi | None. The server only loads a session file you provision on your Mac. In HTTP mode it ignores password, MFA, token, and cookie environment variables and removes them from its process environment. It never attempts a login. |
+| Credentials on the Pi | The provisioned session file contains reusable credentials. Keep it private (directory 0700, file 0600), exclude it from Git and shared backups, and never paste it into logs or support requests. The server loads the session you provision on your Mac. In HTTP mode it ignores password, MFA, token, and cookie environment variables and removes them from its process environment. It never attempts a login. |
 | Expired session | Tool calls fail with a message to reprovision. The session file is **not** deleted, and there are no login retries. `/healthz` stays up. When a new `session.pickle` is copied in, the server picks it up automatically without a restart. |
 | Browser sign-in tool | `authenticate_browser_session` is stdio-only. Over HTTP it is never listed and cannot be called. |
 | Tampered session file | Loaded with a restricted unpickler that cannot construct objects. Symlinks, group- or world-writable files, and unexpected fields are refused. |
@@ -56,7 +56,7 @@ This writes `~/.monarch-mcp-pi/session.pickle` with mode 0600 and prints only th
 ### Copy it to the Pi
 
 ```bash
-PI=user@ntriplealab-pi          # your SSH target
+PI=user@mcp-pi          # your SSH target
 
 # Lands in your Pi home directory as 0600 (a plain scp could leave it world-readable).
 ssh "$PI" 'umask 077 && cat > ~/monarch-session.pickle' < ~/.monarch-mcp-pi/session.pickle
@@ -64,7 +64,7 @@ ssh -t "$PI" 'sudo install -o 10001 -g 10001 -m 0600 ~/monarch-session.pickle /o
   && sudo mv /opt/mcp/monarch/state/session.pickle.new /opt/mcp/monarch/state/session.pickle \
   && rm -f ~/monarch-session.pickle'
 
-rm -f ~/.monarch-mcp-pi/session.pickle   # the Pi now holds the only copy
+rm -f ~/.monarch-mcp-pi/session.pickle   # remove this temporary local copy after verifying the transfer
 ```
 
 The `install` + `mv` swaps the file in atomically inside the state directory. Because the server detects the change, it needs no restart.
@@ -81,7 +81,7 @@ sudo git clone https://github.com/NTripleA/monarch-mcp.git /opt/mcp/monarch/src
 
 # Settings (no credentials in here). Mode 0600, owned by whoever runs `docker compose`.
 sudo install -m 0600 /opt/mcp/monarch/src/deploy/monarch-mcp.env.example /opt/mcp/monarch/monarch-mcp.env
-sudoedit /opt/mcp/monarch/monarch-mcp.env    # check MONARCH_ALLOWED_HOSTS=monarch.ntriplealab.com
+sudoedit /opt/mcp/monarch/monarch-mcp.env    # check MONARCH_ALLOWED_HOSTS=monarch.example.com
 
 # Build (native arm64) and start.
 cd /opt/mcp/monarch/src
@@ -115,11 +115,11 @@ sudo docker compose logs --tail 50 monarch-mcp
 
 ## 4. Cloudflare (configured in the dashboard, not in this repo)
 
-1. **Tunnel.** On the existing `ntriplealab-pi` tunnel, add a public hostname `monarch.ntriplealab.com` with service **HTTP** → `127.0.0.1:8004`.
+1. **Tunnel.** On the existing `mcp-pi` tunnel, add a public hostname `monarch.example.com` with service **HTTP** → `127.0.0.1:8004`.
    - Leave the origin Host header as the public hostname (the default). If you override it, add the override to `MONARCH_ALLOWED_HOSTS`, or every request gets 421.
    - If `cloudflared` itself runs in a container, it needs host networking for `127.0.0.1:8004` to reach the Pi's loopback.
-2. **Access.** Create an Access application for `monarch.ntriplealab.com` and turn on **Protect with Access**. Enable **Managed OAuth** so Claude and ChatGPT can complete the OAuth flow. Restrict the policy to your own identity.
-3. **Connector URL.** Add `https://monarch.ntriplealab.com/mcp` as a custom connector in Claude and in ChatGPT.
+2. **Access.** Create an Access application for `monarch.example.com` and turn on **Protect with Access**. Enable **Managed OAuth** so Claude and ChatGPT can complete the OAuth flow. Restrict the policy to your own identity.
+3. **Connector URL.** Add `https://monarch.example.com/mcp` as a custom connector in Claude and in ChatGPT.
 4. **Claude root-path workaround** (only if needed). If Claude's hosted connector sends requests to `/` instead of `/mcp`, add a Cloudflare URL-rewrite rule for this hostname that rewrites path `/` → `/mcp`. It must be an internal rewrite, not a redirect. The server only serves `/mcp` and `/healthz`.
 
 `/mcp` answers `POST` only. The server is stateless, so `GET` (a server-push stream) and `DELETE` (session teardown) return 405, which the MCP spec allows.
