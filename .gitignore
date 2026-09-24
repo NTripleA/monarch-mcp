@@ -79,3 +79,53 @@ logs.sh
 
 # Local auth-debugging tools (kept out of the repo; inert unless MONARCH_DEBUG_MFA=true)
 debug_*.py
+
+# Private environment files; keep sanitized templates shareable.
+.env
+.env.*
+!.env.example
+!.env.*.example
+!.env.sample
+!.env.template
+.dev.vars
+.dev.vars.*
+
+# Local MCP client configuration may contain credentials.
+.mcp.json
+.mcp.local.json
+claude_desktop_config.json
+
+# Credentials, OAuth clients, cookies, and runtime sessions.
+credentials.json
+credentials.*.json
+client_secret*.json
+client_secrets*.json
+service-account*.json
+service_account*.json
+token.json
+token.*.json
+*.token.json
+tokens.json
+session.json
+session.*.json
+session.pickle
+session.pkl
+cookies.json
+cookies.txt
+.cookies
+.git-credentials
+secrets/
+.secrets/
+
+# Local Cloudflare configuration and private key material.
+.cloudflared/
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
+# Monarch session storage when redirected into the checkout.
+.monarch-mcp/
+mm_session.pickle

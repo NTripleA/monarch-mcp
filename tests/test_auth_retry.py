@@ -6,7 +6,16 @@ import pytest
 
 
 class TestAuthenticationRetry:
-    """Test authentication error handling and automatic session clearing."""
+    """Test authentication error handling and automatic session clearing.
+
+    Clearing the session and re-logging-in only happens when fallback credentials
+    exist (stdio). Session-only behavior is covered in test_session_only_auth.py.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _fallback_credentials(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("MONARCH_EMAIL", "user@example.com")
+        monkeypatch.setenv("MONARCH_PASSWORD", "not-a-real-password")
 
     @pytest.mark.asyncio
     async def test_api_call_with_retry_handles_401(self):
@@ -144,41 +153,27 @@ class TestAuthenticationRetry:
 
     @pytest.mark.asyncio
     async def test_initialize_client_loads_session_without_validation(self):
-        """Test that initialize_client loads existing sessions without validating them."""
-        import os
+        """A saved session is loaded (without a network call) before any login is tried."""
+        import pickle
 
         import server
 
-        # Reset auth state before test
-        original_auth_state = server.auth_state
         server.auth_state = server.AuthState.NOT_INITIALIZED
+        server.session_file.write_bytes(pickle.dumps({"token": "tok_saved", "auth_mode": "token"}))
+        server.session_file.chmod(0o600)
 
-        try:
-            # Mock environment variables
-            with (
-                patch.dict(os.environ, {"MONARCH_EMAIL": "test@example.com", "MONARCH_PASSWORD": "testpass"}),
-                patch("server.session_file") as mock_session_file,
-                patch("server.MonarchMoney") as mock_mm_class,
-            ):
-                # Setup: session file exists
-                mock_session_file.exists.return_value = True
+        with patch("server.MonarchMoney") as mock_mm_class:
+            mock_client = AsyncMock()
+            mock_mm_class.return_value = mock_client
 
-                # Mock the client
-                mock_client = AsyncMock()
-                mock_mm_class.return_value = mock_client
+            await server.initialize_client()
 
-                # Call initialize_client
-                await server.initialize_client()
-
-                # Verify that session was loaded (load_session called)
-                assert mock_client.load_session.called
-                # Verify that login was NOT called (we loaded existing session)
-                assert not mock_client.login.called
-                # Verify auth state is AUTHENTICATED after loading session
-                assert server.auth_state == server.AuthState.AUTHENTICATED
-        finally:
-            # Restore original state
-            server.auth_state = original_auth_state
+            mock_mm_class.assert_called_once_with(token="tok_saved")
+            # Built straight from the validated data: no unrestricted load_session() unpickle.
+            assert not mock_client.load_session.called
+            assert not mock_client.login.called
+            assert not mock_client.get_accounts.called
+            assert server.auth_state == server.AuthState.AUTHENTICATED
 
     def test_clear_session_removes_both_session_files(self):
         """Test that clear_session removes both custom and monarchmoney session files."""

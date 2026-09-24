@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+### Remote deployment over Streamable HTTP
+
+- new `--transport http` mode (or `MONARCH_TRANSPORT=http`): stateless Streamable HTTP on `/mcp` plus a minimal `GET /healthz`, always-on Host/Origin (DNS-rebinding) validation driven by `MONARCH_ALLOWED_HOSTS`, and a request-body cap. stdio is unchanged and remains the default.
+- Docker image (arm64-ready, non-root uid 10001, read-only root filesystem) plus `compose.yaml` and a Raspberry Pi + Cloudflare Access runbook in `deploy/README.md`.
+- `server.py --provision-session` creates a session file on your own machine for copying to a remote server.
+
+### Safety
+
+- `MONARCH_ENABLE_WRITES` kill switch (default off over HTTP, on for stdio). Disabled write tools are hidden from `tools/list` and refused on direct calls. `authenticate_browser_session` is stdio-only.
+- a saved session is now tried before any credentials are required, so a server can run with nothing but `session.pickle`. Session-only servers never delete the session or retry logins, and they pick up a freshly copied session without a restart.
+- session files are written atomically with mode 0600 and read with a restricted unpickler. Writable-by-others files, symlinks, and unexpected contents are refused.
+- logs no longer contain tool arguments, IDs, merchants, amounts, notes, search text, or exception messages, and credentials are scrubbed from error text returned to clients.
+- write tools reject unknown argument names. `update_transactions_bulk` validates the whole batch first (strict types, no duplicate IDs, at most `MONARCH_MAX_BULK_UPDATES`, default 25). Writes never auto-retry after a timeout or dropped connection; the error says the change may already have been applied.
+- tool annotations mark record-replacing tools as destructive.
+- new read-only `monarch_auth_status` tool (23 tools total).
+
+### Fixes
+
+- `refresh_accounts` now passes the account IDs the library requires. `create_manual_account` now matches the library's signature (`account_sub_type` is required).
+- dates in transaction updates are sent as ISO strings; the GraphQL transport could not serialize `date` objects.
+- the published wheel now includes `browser_auth.py`.
+
 ## 2026-06-30
 
 ### Transaction splitting (0.4.0)

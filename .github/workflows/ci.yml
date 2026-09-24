@@ -26,7 +26,7 @@ jobs:
         run: uv sync --all-groups
 
       - name: Run type checking
-        run: uv run mypy server.py
+        run: uv run mypy server.py browser_auth.py http_app.py
 
       - name: Run tests with coverage
         run: uv run python -m pytest tests/ -v --tb=short --cov=. --cov-report=term-missing --cov-report=xml

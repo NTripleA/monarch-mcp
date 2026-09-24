@@ -1,6 +1,7 @@
 """Tests for login paths: cookie auth, CAPTCHA handling, forced login, and TOTP-safe retries."""
 
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -55,7 +56,7 @@ class TestCookieAuthentication:
         session_file = tmp_path / "session.pickle"
         mock_client = MagicMock()
         mock_client.login_with_cookies = AsyncMock()
-        mock_client.save_session = MagicMock(side_effect=lambda path: session_file.write_bytes(b"x"))
+        mock_client.save_session = MagicMock(side_effect=lambda path: Path(path).write_bytes(b"x"))
 
         with patch("server.mm_client", mock_client), patch("server.session_file", session_file):
             await authenticate_with_cookies("session_id=abc; csrftoken=def")
@@ -120,7 +121,7 @@ class TestTokenAuthentication:
         session_file = tmp_path / "session.pickle"
         mock_client = MagicMock()
         mock_client.get_accounts = AsyncMock(return_value={"accounts": []})
-        mock_client.save_session = MagicMock(side_effect=lambda path: session_file.write_bytes(b"x"))
+        mock_client.save_session = MagicMock(side_effect=lambda path: Path(path).write_bytes(b"x"))
 
         with (
             patch("server.MonarchMoney", return_value=mock_client) as mock_cls,

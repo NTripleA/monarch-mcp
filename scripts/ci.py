@@ -7,7 +7,7 @@ import sys
 CHECKS = [
     (["ruff", "check", "."], "ruff check"),
     (["ruff", "format", "--check", "."], "ruff format"),
-    (["mypy", "server.py"], "mypy"),
+    (["mypy", "server.py", "browser_auth.py", "http_app.py"], "mypy"),
     (["pytest", "tests/", "--tb=short", "-q"], "tests"),
 ]
 

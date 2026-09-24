@@ -267,6 +267,26 @@ Sessions are cached in `~/.monarch-mcp/` for faster subsequent logins (override 
 - Make sure your system clock is accurate (required for TOTP)
 - If login fails with "Your code was invalid" or a CAPTCHA error, the problem is Cloudflare, not your MFA code — re-seed with fresh [session cookies](#getting-your-session-cookies)
 
+A saved session is always tried first, so a server with a valid `session.pickle` needs no credentials at all. Session files are written atomically with mode 0600 and loaded with a restricted unpickler; files that others can write are refused. The read-only `monarch_auth_status` tool reports whether a session is present and working without revealing anything about it.
+
+## Remote deployment (Streamable HTTP)
+
+Besides local stdio, the server can run as a remote MCP server over Streamable HTTP:
+
+```bash
+uv run python server.py --transport http     # or MONARCH_TRANSPORT=http
+```
+
+It serves `POST /mcp` (stateless) and `GET /healthz` on `MONARCH_HTTP_HOST:MONARCH_HTTP_PORT` (default `127.0.0.1:8000`). Remote mode is locked down by default:
+
+- **Writes off.** `MONARCH_ENABLE_WRITES` defaults to `false` over HTTP (and stays `true` for stdio). Disabled write tools are hidden from `tools/list` and refused if called directly.
+- **Session-file only.** HTTP mode never logs in. It uses a session provisioned elsewhere (`server.py --provision-session`) and ignores password, MFA, token, and cookie environment variables.
+- **No browser sign-in.** `authenticate_browser_session` exists only over stdio.
+- **Host/Origin allowlist.** Set `MONARCH_ALLOWED_HOSTS` to your public hostname. Anything else gets 421.
+- **Bounded bulk writes.** `update_transactions_bulk` accepts at most `MONARCH_MAX_BULK_UPDATES` (default 25) and validates the whole batch before changing anything.
+
+The server does no authentication of its own. Put it behind something that does, such as Cloudflare Access. The Docker image, `compose.yaml`, and a complete Raspberry Pi + Cloudflare Tunnel runbook are in [`deploy/README.md`](deploy/README.md).
+
 ## Development
 
 ### Local setup
@@ -320,10 +340,11 @@ uv run scripts/eval_session.py analyze            # analyze new entries
 
 > **Warning**: Monarch Money does not provide an official API. This server uses unofficial API access that requires your actual account credentials. Use with appropriate caution.
 
-- The server runs locally on your machine — your credentials live in your MCP client config and **never pass through the LLM**. Only the financial data you actually query is returned to the assistant.
+- By default the server runs locally on your machine — your credentials live in your MCP client config and **never pass through the LLM**. (For the remote mode, see [Remote deployment](#remote-deployment-streamable-http).) Only the financial data you actually query is returned to the assistant.
 - Your credentials have full account access — treat them like passwords
 - The MFA secret (TOTP key) provides ongoing access
 - Session files in `~/.monarch-mcp/` contain auth tokens — keep them secure
+- Logs record tool names, timings, result sizes, and error *types* only — never arguments, IDs, merchants, amounts, notes, search text, or credentials
 - Never commit `.env` or `.mcp.json` files to version control
 - This is an unofficial API — Monarch Money could change or restrict access at any time
 

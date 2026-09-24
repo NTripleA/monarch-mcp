@@ -65,7 +65,9 @@ TOOL_CALLS: list[Any] = [
     pytest.param(lambda: server.get_recurring_transactions(), id="get_recurring_transactions"),
     pytest.param(lambda: server.set_budget_amount(category_id="cat_1", amount=500.0), id="set_budget_amount"),
     pytest.param(
-        lambda: server.create_manual_account(account_name="Savings", account_type="savings", balance=1000.0),
+        lambda: server.create_manual_account(
+            account_name="Savings", account_type="depository", account_sub_type="savings", balance=1000.0
+        ),
         id="create_manual_account",
     ),
     pytest.param(lambda: server.get_spending_summary(), id="get_spending_summary"),
@@ -164,9 +166,13 @@ class TestReadToolSuccess:
 
     @pytest.mark.asyncio
     async def test_refresh_accounts_returns_result(self, mock_api: AsyncMock) -> None:
-        mock_api.return_value = {"status": "refresh_requested"}
+        mock_api.side_effect = dispatch(
+            {"get_accounts": {"accounts": [{"id": "acc_1"}, {"id": "acc_2"}]}, "request_accounts_refresh": True}
+        )
         result = await server.refresh_accounts()
-        assert result.result["status"] == "refresh_requested"
+        assert result.requested is True
+        assert result.account_count == 2
+        mock_api.assert_any_await("request_accounts_refresh", max_retries=1, account_ids=["acc_1", "acc_2"])
 
 
 class TestResourceSuccess:

@@ -21,8 +21,8 @@ def test_every_tool_advertises_output_schema() -> None:
     assert without_schema == []
 
 
-def test_tool_count_is_twenty_two() -> None:
-    assert len(mgr.list_tools()) == 22
+def test_tool_count_is_twenty_three() -> None:
+    assert len(mgr.list_tools()) == 23
 
 
 @pytest.mark.parametrize(

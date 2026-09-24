@@ -1,11 +1,44 @@
 """Shared pytest fixtures for the test suite."""
 
+import os
 from collections.abc import Iterator
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
 
 import server
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep every test away from real credentials, the real session, and leaked settings.
+
+    - Strips MONARCH_* variables so a developer's shell credentials never reach a test.
+    - Points the session directory at a per-test temp dir, so no test can read, write,
+      or delete ~/.monarch-mcp.
+    - Resets the runtime to stdio defaults (writes on) and clears auth bookkeeping.
+    """
+    for name in list(os.environ):
+        if name.startswith("MONARCH_"):
+            monkeypatch.delenv(name)
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir(mode=0o700)
+    monkeypatch.setattr(server, "session_dir", state_dir)
+    monkeypatch.setattr(server, "session_file", state_dir / "session.pickle")
+
+    runtime = (server.RUNTIME.transport, server.RUNTIME.writes_enabled, server.RUNTIME.max_bulk_updates)
+    server.RUNTIME.transport = "stdio"
+    server.RUNTIME.writes_enabled = True
+    server.RUNTIME.max_bulk_updates = server.DEFAULT_MAX_BULK_UPDATES
+    bookkeeping = (server.loaded_session_mtime, server.failed_session_mtime, server.last_failure_category)
+    server.loaded_session_mtime = server.failed_session_mtime = server.last_failure_category = None
+    try:
+        yield
+    finally:
+        server.RUNTIME.transport, server.RUNTIME.writes_enabled, server.RUNTIME.max_bulk_updates = runtime
+        server.loaded_session_mtime, server.failed_session_mtime, server.last_failure_category = bookkeeping
 
 
 @pytest.fixture(autouse=True)

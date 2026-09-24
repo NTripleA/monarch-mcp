@@ -23,7 +23,7 @@ Use generic, obviously-fake examples instead: "Main Credit Card", "Corner Deli",
 
 ### Testing & Validation
 - `uv run pytest tests/ -v --tb=short` - Run all tests
-- `uv run mypy server.py` - Type checking
+- `uv run mypy server.py browser_auth.py http_app.py` - Type checking
 - `uv run ruff check .` - Lint
 - `uv run ruff format --check .` - Format check (use `ruff format .` to auto-fix)
 - `uv run python server.py` - Test server directly (all logs to stderr)
@@ -44,29 +44,36 @@ Use generic, obviously-fake examples instead: "Main Credit Card", "Corner Deli",
 **View usage analytics in Claude's MCP log:**
 ```bash
 # Monitor all analytics (tool calls, performance, errors)
-tail -f /Users/jamie/Library/Logs/Claude/mcp-server-monarch-money.log | grep "\[ANALYTICS\]"
+tail -f <mcp-client-log> | grep "\[ANALYTICS\]"
 
 # Watch for optimization suggestions
-tail -f /Users/jamie/Library/Logs/Claude/mcp-server-monarch-money.log | grep "\[OPTIMIZATION\]"
+tail -f <mcp-client-log> | grep "\[OPTIMIZATION\]"
 
 # Monitor performance (slow operations > 1 second)
-tail -f /Users/jamie/Library/Logs/Claude/mcp-server-monarch-money.log | grep "\[ANALYTICS\]" | grep -E "time: [1-9][0-9]*\.[0-9]+s"
+tail -f <mcp-client-log> | grep "\[ANALYTICS\]" | grep -E "time: [1-9][0-9]*\.[0-9]+s"
 
 # View session summaries and top tools
-tail -f /Users/jamie/Library/Logs/Claude/mcp-server-monarch-money.log | grep "session_summary"
+tail -f <mcp-client-log> | grep "session_summary"
 
 # NEW: Debug tool calls with arguments (for optimization)
-tail -f /Users/jamie/Library/Logs/Claude/mcp-server-monarch-money.log | grep "\[TOOL_CALL\]"
+tail -f <mcp-client-log> | grep "\[TOOL_CALL\]"
 
 # NEW: Monitor result sizes for context usage optimization
-tail -f /Users/jamie/Library/Logs/Claude/mcp-server-monarch-money.log | grep "\[RESULT_SIZE\]"
+tail -f <mcp-client-log> | grep "\[RESULT_SIZE\]"
 
 # NEW: Watch for large results (> 50KB) that may need optimization
-tail -f /Users/jamie/Library/Logs/Claude/mcp-server-monarch-money.log | grep "\[RESULT_SIZE\]" | grep -E "[5-9][0-9]\.[0-9]+ KB|[0-9]{3,}\.[0-9]+ KB"
+tail -f <mcp-client-log> | grep "\[RESULT_SIZE\]" | grep -E "[5-9][0-9]\.[0-9]+ KB|[0-9]{3,}\.[0-9]+ KB"
 ```
 
+**Logging privacy policy (September 2026):** logs carry tool name, outcome, timing, result size,
+coarse `result_count`, and error *type/category* only — never argument values, IDs, merchants,
+amounts, notes, search text, payloads, exception messages, or credentials. `tool_call` logs
+`arg_names` only. `redact_sensitive` redacts financial keys whatever their type, and
+`ThirdPartyLogSanitizer` strips library tracebacks. Use `safe_error_fields(e)` in new log calls, never
+`error=str(e)`. The older marker formats below predate this and no longer include arguments.
+
 **Log Format Examples:**
-- `[TOOL_CALL] get_transactions | args: {'limit': 100, 'start_date': 'last month', 'verbose': False}`
+- `[TOOL_CALL] get_transactions | arg_names: ['limit', 'start_date', 'verbose']`
 - `[ANALYTICS] tool_called: get_transactions | time: 0.234s | status: success`
 - `[RESULT_SIZE] get_transactions | chars: 12,543 | size: 12.25 KB | transactions: 42 items`
 - `[OPTIMIZATION] Consider using get_complete_financial_overview instead of separate get_accounts + get_transactions calls`
@@ -171,7 +178,7 @@ refactor: split server.py into modular components (auth, tools, models)
 - Structured logging with `structlog` for debugging
 - Environment variables: `MONARCH_EMAIL`, `MONARCH_PASSWORD`, `MONARCH_MFA_SECRET`
 
-**Complete Monarch Money API Coverage (22 Tools)**
+**Complete Monarch Money API Coverage (23 Tools)**
 - **Core**: `get_accounts`, `get_transactions`, `get_budgets`, `get_cashflow`
 - **Categories**: `get_transaction_categories`
 - **Transactions**: `create_transaction`, `update_transaction`, `update_transactions_bulk`, `search_transactions`
@@ -180,11 +187,17 @@ refactor: split server.py into modular components (auth, tools, models)
 - **Banking**: `get_institutions`, `refresh_accounts`
 - **Planning**: `get_recurring_transactions`, `set_budget_amount`
 - **Manual**: `create_manual_account`
-- **Auth**: `authenticate_browser_session` (browser sign-in via MCP `elicit_url`; captures cookies on a one-shot loopback server and re-seeds the session)
+- **Auth**: `authenticate_browser_session` (stdio only; browser sign-in via MCP `elicit_url`; captures cookies on a one-shot loopback server and re-seeds the session), `monarch_auth_status` (read-only, safe diagnostics)
 - **Batch Operations**: `get_spending_summary`, `update_transactions_bulk`
 - **Intelligent Analysis**: `get_complete_financial_overview`, `analyze_spending_patterns`
 
 Also exposes 5 MCP resources (3 static lists + 2 parameterized templates: `accounts://{account_id}/holdings|history`) and 4 prompt templates.
+
+**Transports & safety gates (September 2026)**
+- `--transport stdio` (default) or `--transport http` / `MONARCH_TRANSPORT=http`. HTTP mode lives in `http_app.py`: stateless Streamable HTTP on `POST /mcp` (GET/DELETE → 405), `GET /healthz` → `{"status":"ok"}`, always-on Host/Origin validation (loopback + `MONARCH_ALLOWED_HOSTS`), and a body cap. Each `create_http_app()` owns exactly one `StreamableHTTPSessionManager`, run once by the app lifespan. Deployment: `Dockerfile`, `compose.yaml`, `deploy/README.md`.
+- `RUNTIME` (set by `configure_runtime()`) holds transport, `writes_enabled` (`MONARCH_ENABLE_WRITES`; default false over HTTP, true over stdio), and `max_bulk_updates`.
+- `WRITE_TOOLS` / `LOCAL_ONLY_TOOLS` are enforced twice: `MonarchFastMCP.list_tools`/`call_tool` hide and refuse them, and each tool body calls `require_tool_enabled(name)`. **A new mutating tool must be added to `WRITE_TOOLS` and call the guard** — `tests/test_write_gate.py` fails otherwise.
+- Mutations go through `write_call()`: at most one retry, and only after an auth *rejection*. Ambiguous failures (timeout, dropped connection, 5xx) raise `WriteOutcomeUnknownError` telling the client to check before retrying. Write tools reject unknown argument names.
 
 **Type-Safe Structured Output**
 - Every tool returns a typed Pydantic model, so FastMCP advertises an `outputSchema` and emits structured content (plus a text fallback for older clients). See the "Structured output models" block in `server.py`.
@@ -239,8 +252,15 @@ Published to PyPI as `monarch-mcp-jamiew` and to the MCP Registry as `io.github.
 
 ### Authentication Paths (Updated August 2026)
 
-Three ways in, tried in this order by `initialize_client()`:
+Tried in this order by `initialize_client()`:
 
+0. **Saved session file** — always first, and needs no credentials. It is read once by
+   `read_session_file()` with a restricted unpickler (no object construction; refuses
+   symlinks, group/world-writable files, and unexpected fields). The client is then
+   built with `MonarchMoney(token=...)` + `set_cookies()` — never the library's
+   `load_session()`. **HTTP mode stops here** (session-only): it ignores and drops all
+   credential env vars, never logs in, never deletes the session, and reloads only when
+   `session.pickle`'s mtime changes. stdio without credentials behaves the same way.
 1. **Token auth** — set `MONARCH_TOKEN` to the value after `Token ` in the
    `Authorization` header of a GraphQL request from a logged-in app.monarch.com session.
    Note that Monarch's web client does not always send that header (it may authenticate
@@ -282,8 +302,9 @@ window before an MFA retry rather than replaying a code Monarch has already cons
 
 ### Session Management
 
-- Session files stored in `~/.monarch-mcp/` directory (created automatically; override via `MONARCH_SESSION_DIR`)
-- Session invalidation handled gracefully with automatic re-authentication
+- Session files stored in `~/.monarch-mcp/` directory (created automatically as 0700; override via `MONARCH_SESSION_DIR`)
+- `persist_session()` writes atomically (temp file in the same dir + `os.replace`) with mode 0600
+- With fallback credentials (stdio): session invalidation triggers `clear_session()` + re-authentication. Session-only: the file is kept and the error tells the user to reprovision (`server.py --provision-session`)
 - Use `MONARCH_FORCE_LOGIN=true` to bypass session cache for debugging
 - Sessions follow Monarch Money API session management patterns
 

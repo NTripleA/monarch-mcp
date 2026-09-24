@@ -149,7 +149,7 @@ class TestNewMonarchTools:
 
         try:
             result = await server.create_manual_account(
-                account_name="My Savings", account_type="savings", balance=1000.0
+                account_name="My Savings", account_type="depository", account_sub_type="savings", balance=1000.0
             )
 
             assert isinstance(result, server.CreateAccountResult)
@@ -159,8 +159,11 @@ class TestNewMonarchTools:
             mock_client.create_manual_account.assert_called_once()
             call_args = mock_client.create_manual_account.call_args
             assert call_args.kwargs["account_name"] == "My Savings"
-            assert call_args.kwargs["account_type"] == "savings"
-            assert call_args.kwargs["balance"] == 1000.0
+            # Mapped onto the library's signature (it takes account_balance, not balance).
+            assert call_args.kwargs["account_type"] == "depository"
+            assert call_args.kwargs["account_sub_type"] == "savings"
+            assert call_args.kwargs["is_in_net_worth"] is True
+            assert call_args.kwargs["account_balance"] == 1000.0
 
         finally:
             server.mm_client = original_client

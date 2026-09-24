@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-from datetime import date
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -101,21 +100,19 @@ class TestBulkTransactionUpdates:
 
     @pytest.mark.asyncio
     async def test_update_transactions_bulk_missing_transaction_id(self):
-        """Test error handling when transaction_id is missing."""
+        """A missing transaction_id rejects the whole batch before any update is sent."""
         from server import update_transactions_bulk
 
         mock_client = MagicMock()
+        mock_client.update_transaction = AsyncMock()
 
-        updates_json = json.dumps([{"amount": 50.0, "notes": "Missing ID"}])
+        updates_json = json.dumps([{"transaction_id": "txn_1", "notes": "ok"}, {"amount": 50.0, "notes": "Missing ID"}])
 
         with patch("server.mm_client", mock_client), patch("server.ensure_authenticated", new_callable=AsyncMock):
-            result_str = await update_transactions_bulk(updates_json)
-            result = json.loads(result_str.model_dump_json())
+            with pytest.raises(ValueError, match=r"item 1: transaction_id: Field required"):
+                await update_transactions_bulk(updates_json)
 
-            # Should have error result
-            assert result["summary"]["failed"] == 1
-            assert result["results"][0]["status"] == "error"
-            assert "transaction_id is required" in result["results"][0]["error"]
+        mock_client.update_transaction.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_update_transactions_bulk_empty_array(self):
@@ -146,13 +143,10 @@ class TestBulkTransactionUpdates:
             # Verify date was passed correctly
             assert result["results"][0]["status"] == "success"
 
-            # Check that update_transaction was called with a date object
+            # Sent as an ISO string: the GraphQL transport serializes variables with
+            # json.dumps, which cannot encode a date object.
             call_kwargs = mock_client.update_transaction.call_args[1]
-            assert "date" in call_kwargs
-            assert isinstance(call_kwargs["date"], date)
-            assert call_kwargs["date"].year == 2024
-            assert call_kwargs["date"].month == 1
-            assert call_kwargs["date"].day == 15
+            assert call_kwargs["date"] == "2024-01-15"
 
     @pytest.mark.asyncio
     async def test_update_transactions_bulk_all_fields(self):
@@ -188,7 +182,7 @@ class TestBulkTransactionUpdates:
             assert call_kwargs["merchant_name"] == "Updated merchant"
             assert call_kwargs["category_id"] == "cat_456"
             assert call_kwargs["notes"] == "Updated notes"
-            assert isinstance(call_kwargs["date"], date)
+            assert call_kwargs["date"] == "2024-02-20"
 
     @pytest.mark.asyncio
     async def test_update_transactions_bulk_parallel_execution(self):

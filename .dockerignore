@@ -1,0 +1,8 @@
+# Only the build inputs listed in the Dockerfile are needed. Never send secrets,
+# sessions, or local environments into the build context.
+*
+!pyproject.toml
+!uv.lock
+!server.py
+!browser_auth.py
+!http_app.py

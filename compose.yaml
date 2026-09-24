@@ -1,0 +1,40 @@
+# Remote deployment on the Raspberry Pi. See deploy/README.md.
+#
+#   Cloudflare Access -> Cloudflare Tunnel -> 127.0.0.1:8004 -> container:8000/mcp
+#
+# Changes to the env_file take effect only when the container is recreated:
+#   docker compose up -d --force-recreate monarch-mcp
+# (`docker restart` / `docker compose restart` keep the old environment.)
+services:
+  monarch-mcp:
+    build: .
+    image: monarch-mcp:local
+    container_name: monarch-mcp
+    restart: unless-stopped
+    user: "10001:10001"
+    ports:
+      # Host loopback only; the tunnel is the only way in from outside.
+      - "127.0.0.1:8004:8000"
+    env_file:
+      - /opt/mcp/monarch/monarch-mcp.env
+    environment:
+      MONARCH_TRANSPORT: http
+      MONARCH_HTTP_HOST: 0.0.0.0
+      MONARCH_HTTP_PORT: "8000"
+      MONARCH_SESSION_DIR: /state
+    volumes:
+      - /opt/mcp/monarch/state:/state
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 384m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
