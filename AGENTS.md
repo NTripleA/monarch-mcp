@@ -251,7 +251,7 @@ Update this file when:
 | [`keithah/monarchmoney-enhanced`](https://github.com/keithah/monarchmoney-enhanced) | Sibling fork (stale) | Stale since Jan 2026. Large feature surface (~126 methods), but lacks our fork's attachment/receipt methods. Cherry-pick GraphQL queries from it rather than switching. |
 
 **Dependency Pin:**
-- In `pyproject.toml` → `[tool.uv.sources]`, `monarchmoneycommunity` is pinned to a specific commit SHA (`c6904e4ec8938c7386e73ed503b7c0a0693dd6a4`) representing `dev` HEAD for reproducible builds.
+- In `pyproject.toml` → `[tool.uv.sources]`, `monarchmoneycommunity` is pinned to a specific commit SHA (`c6904e4ec8938c7386e73ed503b7c0a0693dd6a4`) for reproducible builds. It is an intentionally kept known-good commit (`dev` HEAD on 2026-06-30), now behind upstream `dev` (`62bf8b1` as of 2026-09-28); newer upstream GraphQL is ported into `server.py` rather than bumping the pin. See CLAUDE.md's "Upstream Library & Fork Landscape".
 - When updating, update the commit SHA and comment in `pyproject.toml`.
 
 **Unused Capabilities in Current Fork (Quick Tool Wins):**

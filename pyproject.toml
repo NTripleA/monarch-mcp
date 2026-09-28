@@ -159,5 +159,9 @@ exclude_lines = [
 
 [tool.uv.sources]
 # Pinned to a specific commit (not a moving branch) for reproducible builds.
-# This is the fork's `dev` HEAD as of 2026-06-30 — see "Upstream library" in CLAUDE.md.
+# c6904e4 is an intentionally pinned known-good commit (the fork's `dev` HEAD on
+# 2026-06-30). It is currently behind upstream `dev` (62bf8b1, 79 commits ahead, as of
+# 2026-09-28). Features that need newer upstream GraphQL, such as the transaction-rule
+# tools, port that GraphQL into server.py instead of bumping this pin.
+# See "Upstream library" in CLAUDE.md.
 monarchmoneycommunity = { git = "https://github.com/bradleyseanf/monarchmoneycommunity", rev = "c6904e4ec8938c7386e73ed503b7c0a0693dd6a4" }
