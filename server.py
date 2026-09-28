@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, ParamSpec, TypeVar
+from typing import Annotated, Any, Literal, ParamSpec, TypeVar
 
 import aiohttp
 import structlog
@@ -59,7 +59,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    FiniteFloat,
     JsonValue,
     StrictBool,
     StrictStr,
@@ -956,6 +955,10 @@ class RuleTextCriterion(BaseModel):
         return {"operator": self.operator, "value": self.value}
 
 
+# A real, finite, nonnegative number: no strings, no booleans (True would otherwise become 1.0).
+RuleAmount = Annotated[float, Field(strict=True, allow_inf_nan=False, ge=0)]
+
+
 class RuleAmountCriterion(BaseModel):
     """Match a transaction amount, ignoring its sign.
 
@@ -967,9 +970,9 @@ class RuleAmountCriterion(BaseModel):
 
     operator: Literal["gt", "lt", "eq", "between"]
     is_expense: StrictBool = True
-    value: FiniteFloat | None = Field(default=None, ge=0)
-    lower: FiniteFloat | None = Field(default=None, ge=0)
-    upper: FiniteFloat | None = Field(default=None, ge=0)
+    value: RuleAmount | None = None
+    lower: RuleAmount | None = None
+    upper: RuleAmount | None = None
 
     @model_validator(mode="after")
     def _check_bounds(self) -> "RuleAmountCriterion":
@@ -3078,12 +3081,19 @@ RULE_VERIFY_HINT = "Call get_transaction_rules and check whether the intended ru
 
 
 async def _fetch_transaction_rules() -> list[JsonValue]:
-    """Read every transaction rule, in Monarch's priority order."""
+    """Read every transaction rule, in Monarch's priority order.
+
+    Strict on purpose: this is how callers check whether an ambiguous create landed, so
+    an unexpected response must fail rather than look like "no rules".
+    """
     response = await api_call_with_retry(
         "gql_call", operation="GetTransactionRules", graphql_query=GET_TRANSACTION_RULES, variables={}
     )
-    rules: list[JsonValue] = convert_dates_to_strings(extract_list(response, "transactionRules"))
-    return rules
+    rules = response.get("transactionRules") if isinstance(response, dict) else None
+    if not isinstance(rules, list):
+        raise ValueError("Monarch returned an invalid transaction-rules response")
+    converted: list[JsonValue] = convert_dates_to_strings(rules)
+    return converted
 
 
 def _rule_ids(name: str, ids: list[str] | None) -> list[JsonValue] | None:
@@ -3148,6 +3158,8 @@ def build_rule_input(
     if merchant_action is not None:
         actions["setMerchantAction"] = merchant_action
     if hide_from_reports is not None:
+        if not isinstance(hide_from_reports, bool):
+            raise ValueError("hide_from_reports must be true or false")
         actions["setHideFromReportsAction"] = hide_from_reports
     if not actions:
         raise ValueError("A rule needs at least one action: set_category_id, set_merchant_name, or hide_from_reports")
@@ -3234,7 +3246,7 @@ async def preview_transaction_rule(
     category_ids: list[str] | None = None,
     set_category_id: str | None = None,
     set_merchant_name: str | None = None,
-    hide_from_reports: bool | None = None,
+    hide_from_reports: StrictBool | None = None,
     offset: int = 0,
 ) -> RulePreviewResult:
     """Show which existing transactions a proposed rule would match, without saving anything.
@@ -3267,15 +3279,14 @@ async def preview_transaction_rule(
         graphql_query=PREVIEW_TRANSACTION_RULE,
         variables={"rule": rule, "offset": offset},
     )
+    # Strict on purpose: a malformed response must not pass for a safe zero-match preview.
     preview = response.get("transactionRulePreview") if isinstance(response, dict) else None
-    if not isinstance(preview, dict):
+    results = preview.get("results") if isinstance(preview, dict) else None
+    total_count = preview.get("totalCount") if isinstance(preview, dict) else None
+    if not isinstance(results, list) or not isinstance(total_count, int) or isinstance(total_count, bool):
         raise ValueError("Monarch returned an invalid rule preview response")
-    matches: list[JsonValue] = convert_dates_to_strings(extract_list(preview, "results"))
-    total_count = preview.get("totalCount")
-    return RulePreviewResult(
-        total_count=total_count if isinstance(total_count, int) else len(matches),
-        matches=matches,
-    )
+    matches: list[JsonValue] = convert_dates_to_strings(results)
+    return RulePreviewResult(total_count=total_count, matches=matches)
 
 
 @mcp.tool(annotations=WRITE_CREATE_MAY_MODIFY, title="Create Transaction Rule")
@@ -3288,8 +3299,8 @@ async def create_transaction_rule(
     category_ids: list[str] | None = None,
     set_category_id: str | None = None,
     set_merchant_name: str | None = None,
-    hide_from_reports: bool | None = None,
-    apply_to_existing_transactions: bool = False,
+    hide_from_reports: StrictBool | None = None,
+    apply_to_existing_transactions: StrictBool = False,
 ) -> CreateRuleResult:
     """Create a transaction rule that Monarch applies to new transactions.
 
@@ -3311,7 +3322,9 @@ async def create_transaction_rule(
 
     Actions:
         set_category_id: Category ID from get_transaction_categories.
-        set_merchant_name: Rename the merchant (a name, not an ID).
+        set_merchant_name: Rename the merchant (a name, not an ID). Side effect: Monarch may
+            create a merchant record with this name, and deleting the rule later does not
+            necessarily remove that merchant.
         hide_from_reports: Hide (True) or unhide (False) matching transactions from reports.
 
     apply_to_existing_transactions=True also rewrites matching past transactions
@@ -3324,6 +3337,8 @@ async def create_transaction_rule(
     and check whether the rule exists before retrying.
     """
     require_tool_enabled("create_transaction_rule")
+    if not isinstance(apply_to_existing_transactions, bool):
+        raise ValueError("apply_to_existing_transactions must be true or false")
     rule = build_rule_input(
         merchant_criteria=merchant_criteria,
         original_statement_criteria=original_statement_criteria,

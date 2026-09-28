@@ -132,8 +132,27 @@ class TestGetTransactionRules:
         ):
             assert field in query
 
-    async def test_unexpected_shape_yields_empty_list(self, mock_api: AsyncMock) -> None:
-        mock_api.return_value = {"somethingElse": []}
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {"somethingElse": []},
+            {"transactionRules": None},
+            {"transactionRules": {"id": "rule_001"}},
+            {"transactionRules": "rule_001"},
+            [STORED_RULE],
+            None,
+        ],
+    )
+    async def test_malformed_response_raises_instead_of_reporting_no_rules(
+        self, mock_api: AsyncMock, response: Any
+    ) -> None:
+        # get_transaction_rules is how callers check an ambiguous create; "0 rules" would invite a duplicate.
+        mock_api.return_value = response
+        with pytest.raises(ValueError, match="invalid transaction-rules response"):
+            await server.get_transaction_rules()
+
+    async def test_empty_rule_list_is_valid(self, mock_api: AsyncMock) -> None:
+        mock_api.return_value = rules_list()
         result = await server.get_transaction_rules()
         assert result.rules == []
         assert result.count == 0
@@ -291,11 +310,35 @@ class TestRuleValidation:
             {"operator": "eq", "value": 5, "direction": "out"},
             {"operator": "eq", "value": float("inf")},
             {"operator": "eq", "value": 5, "is_expense": "false"},
+            {"operator": "eq", "value": True},
+            {"operator": "eq", "value": False},
+            {"operator": "gt", "value": "20"},
+            {"operator": "between", "lower": "1", "upper": 5},
+            {"operator": "between", "lower": 1, "upper": "5"},
+            {"operator": "between", "lower": False, "upper": 5},
+            {"operator": "between", "lower": 1, "upper": True},
         ],
     )
     def test_invalid_amount_criteria(self, fields: dict[str, Any]) -> None:
         with pytest.raises(ValidationError):
             server.RuleAmountCriterion.model_validate(fields)
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"operator": "eq", "value": 20},
+            {"operator": "gt", "value": 20.5},
+            {"operator": "lt", "value": 0},
+            {"operator": "between", "lower": 10, "upper": 50},
+        ],
+    )
+    def test_real_numbers_are_valid_amounts(self, fields: dict[str, Any]) -> None:
+        server.RuleAmountCriterion.model_validate(fields)
+
+    @pytest.mark.parametrize("value", ["true", 1, 0, "false"])
+    def test_non_strict_hide_from_reports_is_rejected(self, value: Any) -> None:
+        with pytest.raises(ValueError, match="hide_from_reports must be true or false"):
+            build(merchant_criteria=[DELI], hide_from_reports=value)
 
 
 # ---------------------------------------------------------------------------
@@ -354,10 +397,33 @@ class TestPreviewTransactionRule:
             await server.preview_transaction_rule(merchant_criteria=[DELI])
         mock_api.assert_not_called()
 
-    async def test_malformed_response_is_an_error(self, mock_api: AsyncMock) -> None:
-        mock_api.side_effect = gql_dispatch({PREVIEW_OP: {"transactionRulePreview": None}})
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {},
+            {"transactionRulePreview": None},
+            {"transactionRulePreview": {}},
+            {"transactionRulePreview": {"totalCount": 0}},
+            {"transactionRulePreview": {"totalCount": 0, "results": None}},
+            {"transactionRulePreview": {"totalCount": 0, "results": {"id": "txn_123"}}},
+            {"transactionRulePreview": {"results": []}},
+            {"transactionRulePreview": {"totalCount": None, "results": []}},
+            {"transactionRulePreview": {"totalCount": "0", "results": []}},
+            {"transactionRulePreview": {"totalCount": 0.0, "results": []}},
+            {"transactionRulePreview": {"totalCount": False, "results": []}},
+        ],
+    )
+    async def test_malformed_response_is_an_error(self, mock_api: AsyncMock, response: dict[str, Any]) -> None:
+        # Preview is the safety check before creating; it must not fabricate a zero-match result.
+        mock_api.side_effect = gql_dispatch({PREVIEW_OP: response})
         with pytest.raises(ValueError, match="invalid rule preview response"):
             await server.preview_transaction_rule(merchant_criteria=[DELI], set_category_id="cat_001")
+
+    async def test_total_count_is_not_derived_from_results(self, mock_api: AsyncMock) -> None:
+        mock_api.side_effect = gql_dispatch({PREVIEW_OP: {"transactionRulePreview": {"totalCount": 42, "results": []}}})
+        result = await server.preview_transaction_rule(merchant_criteria=[DELI], set_category_id="cat_001", offset=60)
+        assert result.total_count == 42
+        assert result.matches == []
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +535,13 @@ class TestCreateTransactionRuleOutcomes:
         with pytest.raises(RuntimeError, match="upstream API failure"):
             await create()
 
+    async def test_malformed_read_back_list_is_still_success(self, mock_api: AsyncMock) -> None:
+        mock_api.side_effect = gql_dispatch({CREATE_OP: created("rule_001"), LIST_OP: {"somethingElse": []}})
+        result = await create()
+        assert result.rule_id == "rule_001"
+        assert result.rule is None
+        assert "read-back verification was unavailable" in result.message
+
     async def test_rule_not_yet_visible_is_still_success(self, mock_api: AsyncMock) -> None:
         mock_api.side_effect = gql_dispatch({CREATE_OP: created("rule_001"), LIST_OP: rules_list(RICH_RULE)})
         result = await create()
@@ -562,6 +635,56 @@ class TestWriteCallHintIsOptIn:
             "The update may or may not have been applied: the request to Monarch failed (TimeoutError) "
             "after it was sent. Re-read the record to check its current state before sending the update again."
         )
+
+
+class TestStrictBooleans:
+    @pytest.mark.parametrize("value", ["true", "false", 1, 0])
+    async def test_apply_to_existing_rejects_non_bool_via_dispatcher(self, mock_api: AsyncMock, value: Any) -> None:
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        with pytest.raises(ToolError):
+            await server.mcp.call_tool(
+                "create_transaction_rule",
+                {
+                    "merchant_criteria": [{"value": "Corner Deli"}],
+                    "set_category_id": "cat_001",
+                    "apply_to_existing_transactions": value,
+                },
+            )
+        mock_api.assert_not_called()
+
+    @pytest.mark.parametrize("value", ["true", 1])
+    async def test_apply_to_existing_rejects_non_bool_direct_call(self, mock_api: AsyncMock, value: Any) -> None:
+        with pytest.raises(ValueError, match="apply_to_existing_transactions must be true or false"):
+            await create(apply_to_existing_transactions=value)
+        mock_api.assert_not_called()
+
+    @pytest.mark.parametrize("tool", ["create_transaction_rule", "preview_transaction_rule"])
+    @pytest.mark.parametrize("value", ["true", "false", 1, 0])
+    async def test_hide_from_reports_rejects_non_bool_via_dispatcher(
+        self, mock_api: AsyncMock, tool: str, value: Any
+    ) -> None:
+        from mcp.server.fastmcp.exceptions import ToolError
+
+        with pytest.raises(ToolError):
+            await server.mcp.call_tool(
+                tool, {"merchant_criteria": [{"value": "Corner Deli"}], "hide_from_reports": value}
+            )
+        mock_api.assert_not_called()
+
+    async def test_real_booleans_are_accepted_via_dispatcher(self, mock_api: AsyncMock) -> None:
+        calls: list[tuple[str, dict[str, Any]]] = []
+        mock_api.side_effect = gql_dispatch({CREATE_OP: created(), LIST_OP: rules_list(STORED_RULE)}, calls)
+        await server.mcp.call_tool(
+            "create_transaction_rule",
+            {
+                "merchant_criteria": [{"value": "Corner Deli"}],
+                "hide_from_reports": False,
+                "apply_to_existing_transactions": False,
+            },
+        )
+        assert sent_input(calls)["setHideFromReportsAction"] is False
+        assert sent_input(calls)["applyToExistingTransactions"] is False
 
 
 class TestRuleToolsViaDispatcher:
