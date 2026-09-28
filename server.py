@@ -30,7 +30,12 @@ import aiohttp
 import structlog
 from dateutil import parser as date_parser
 from dateutil.relativedelta import relativedelta
-from gql.transport.exceptions import TransportClosed, TransportConnectionFailed, TransportServerError
+from gql import gql
+from gql.transport.exceptions import (
+    TransportClosed,
+    TransportConnectionFailed,
+    TransportServerError,
+)
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ResourceError, ToolError
 from mcp.server.lowlevel.helper_types import ReadResourceContents
@@ -44,17 +49,23 @@ from mcp.types import (
     ToolAnnotations,
 )
 from mcp.types import Tool as MCPTool
-from monarchmoney import CaptchaRequiredException, MonarchMoney, RequireMFAException
+from monarchmoney import (
+    CaptchaRequiredException,
+    MonarchMoney,
+    RequireMFAException,
+)
 from pydantic import (
     AnyUrl,
     BaseModel,
     ConfigDict,
     Field,
+    FiniteFloat,
     JsonValue,
     StrictBool,
     StrictStr,
     ValidationError,
     field_validator,
+    model_validator,
 )
 from structlog.typing import EventDict, WrappedLogger
 
@@ -70,6 +81,10 @@ READONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
 WRITE_CREATE = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False)
 # Overwrites fields of existing financial records (repeating the same call has no further effect).
 WRITE_REPLACE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=False)
+# Adds a new record that can also rewrite existing ones (e.g. a rule applied to past transactions).
+WRITE_CREATE_MAY_MODIFY = ToolAnnotations(
+    readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+)
 # Asks Monarch to re-sync institutions; changes no stored record directly.
 WRITE_REFRESH = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
 # Replaces the locally stored Monarch session.
@@ -85,6 +100,7 @@ WRITE_TOOLS = frozenset(
         "set_budget_amount",
         "create_manual_account",
         "refresh_accounts",
+        "create_transaction_rule",
     }
 )
 
@@ -918,6 +934,76 @@ class UpdateSplitsResult(MMModel):
     transaction_id: str
     has_split_transactions: bool
     splits: list[JsonValue]
+    message: str
+
+
+class RuleTextCriterion(BaseModel):
+    """Match text that contains the value ("contains") or equals it exactly ("eq")."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    operator: Literal["contains", "eq"] = "contains"
+    value: StrictStr
+
+    @field_validator("value")
+    @classmethod
+    def _value_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("value must not be blank")
+        return value
+
+    def to_input(self) -> dict[str, JsonValue]:
+        return {"operator": self.operator, "value": self.value}
+
+
+class RuleAmountCriterion(BaseModel):
+    """Match a transaction amount, ignoring its sign.
+
+    is_expense=True (the default) matches money going out; False matches money coming in.
+    "between" uses lower and upper; every other operator uses value.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    operator: Literal["gt", "lt", "eq", "between"]
+    is_expense: StrictBool = True
+    value: FiniteFloat | None = Field(default=None, ge=0)
+    lower: FiniteFloat | None = Field(default=None, ge=0)
+    upper: FiniteFloat | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def _check_bounds(self) -> "RuleAmountCriterion":
+        # A silently dropped bound would make the rule match more than was asked for.
+        if self.operator == "between":
+            if self.lower is None or self.upper is None or self.value is not None:
+                raise ValueError("between requires lower and upper, and no value")
+            if self.lower > self.upper:
+                raise ValueError("lower must not exceed upper")
+        elif self.value is None or self.lower is not None or self.upper is not None:
+            raise ValueError(f"{self.operator} requires value, and no lower or upper")
+        return self
+
+    def to_input(self) -> dict[str, JsonValue]:
+        value_range: JsonValue = None
+        if self.operator == "between":
+            value_range = {"lower": self.lower, "upper": self.upper}
+        return {"operator": self.operator, "isExpense": self.is_expense, "value": self.value, "valueRange": value_range}
+
+
+class TransactionRulesResult(MMModel):
+    rules: list[JsonValue]
+    count: int
+
+
+class RulePreviewResult(MMModel):
+    total_count: int
+    matches: list[JsonValue]
+
+
+class CreateRuleResult(MMModel):
+    rule_id: str
+    rule: JsonValue | None
+    apply_to_existing_requested: bool
     message: str
 
 
@@ -1830,7 +1916,13 @@ WRITE_TIMEOUT_SECONDS = 30.0
 
 
 async def write_call(
-    method_name: str, *, creates: bool, description: str, max_auth_retries: int = 1, **kwargs: Any
+    method_name: str,
+    *,
+    creates: bool,
+    description: str,
+    max_auth_retries: int = 1,
+    verification_hint: str | None = None,
+    **kwargs: Any,
 ) -> Any:
     """Run a Monarch mutation with write-safe failure handling.
 
@@ -1838,7 +1930,8 @@ async def write_call(
     write may already have landed, and for creates a blind retry duplicates it. The
     only retry is a single one after an auth *rejection*, which proves nothing was
     applied. Ambiguous failures surface as WriteOutcomeUnknownError telling the client
-    to check before retrying.
+    to check before retrying; ``verification_hint`` replaces the default advice on how
+    to check, for records the transaction/account tools cannot see.
     """
     try:
         return await asyncio.wait_for(
@@ -1849,16 +1942,20 @@ async def write_call(
             raise
         log.error("write_outcome_unknown", method=method_name, **safe_error_fields(e))
         if creates:
+            how_to_check = verification_hint or (
+                "first query (e.g. search_transactions / get_transactions / get_accounts) to check "
+                "whether it exists, and only retry if it does not."
+            )
             raise WriteOutcomeUnknownError(
                 f"{description} may already have been created: the request to Monarch failed "
-                f"({type(e).__name__}) after it was sent. Do NOT retry blindly -- first query "
-                "(e.g. search_transactions / get_transactions / get_accounts) to check whether it "
-                "exists, and only retry if it does not."
+                f"({type(e).__name__}) after it was sent. Do NOT retry blindly -- {how_to_check}"
             ) from e
+        how_to_check = (
+            verification_hint or "Re-read the record to check its current state before sending the update again."
+        )
         raise WriteOutcomeUnknownError(
             f"{description} may or may not have been applied: the request to Monarch failed "
-            f"({type(e).__name__}) after it was sent. Re-read the record to check its current "
-            "state before sending the update again."
+            f"({type(e).__name__}) after it was sent. {how_to_check}"
         ) from e
 
 
@@ -2866,6 +2963,419 @@ async def update_transaction_splits(transaction_id: str, splits: list[Transactio
         transaction_id=transaction_id,
         has_split_transactions=bool(transaction.get("hasSplitTransactions")),
         splits=result_splits,
+        message=message,
+    )
+
+
+# =============================================================================
+# Transaction rules. The pinned client library has no rule methods, so these send
+# GraphQL through its gql_call. The list query mirrors upstream monarchmoneycommunity's
+# get_transaction_rules (dev@62bf8b1). Create/preview shapes were cross-checked against
+# several community Monarch clients: merchant matching is written as merchantNameCriteria,
+# setCategoryAction takes a category ID, and a non-null `errors` object is a rejection
+# even when all its fields are null.
+# =============================================================================
+
+GET_TRANSACTION_RULES = gql(
+    """
+    query GetTransactionRules {
+      transactionRules {
+        order
+        ...TransactionRuleFields
+      }
+    }
+
+    fragment TransactionRuleFields on TransactionRuleV2 {
+      id
+      merchantCriteriaUseOriginalStatement
+      merchantCriteria { operator value }
+      originalStatementCriteria { operator value }
+      merchantNameCriteria { operator value }
+      amountCriteria { operator isExpense value valueRange { lower upper } }
+      categoryIds
+      accountIds
+      categories { id name icon }
+      accounts { id displayName icon logoUrl }
+      criteriaOwnerIsJoint
+      criteriaOwnerUserIds
+      criteriaOwnerUsers { id displayName profilePictureUrl }
+      criteriaBusinessEntityIds
+      criteriaBusinessEntityIsUnassigned
+      criteriaBusinessEntities { id name logoUrl color }
+      setMerchantAction { id name }
+      setCategoryAction { id name icon }
+      addTagsAction { id name color }
+      linkGoalAction { id name imageStorageProvider imageStorageProviderId }
+      linkSavingsGoalAction { id name imageStorageProvider imageStorageProviderId }
+      needsReviewByUserAction { id name displayName }
+      unassignNeedsReviewByUserAction
+      sendNotificationAction
+      setHideFromReportsAction
+      setLinkToPaydownBudgetAction
+      reviewStatusAction
+      actionSetOwnerIsJoint
+      actionSetOwner { id displayName profilePictureUrl }
+      actionSetBusinessEntity { id name logoUrl color }
+      actionSetBusinessEntityIsUnassigned
+      recentApplicationCount
+      lastAppliedAt
+      splitTransactionsAction {
+        amountType
+        splitsInfo {
+          categoryId
+          merchantName
+          amount
+          goalId
+          savingsGoalId
+          tags
+          hideFromReports
+          reviewStatus
+          needsReviewByUserId
+          ownerUserId
+          ownerIsJoint
+          businessEntityId
+          businessEntityIsUnassigned
+        }
+      }
+    }
+    """
+)
+
+PREVIEW_TRANSACTION_RULE = gql(
+    """
+    query Common_PreviewTransactionRule($rule: TransactionRulePreviewInput!, $offset: Int) {
+      transactionRulePreview(input: $rule) {
+        totalCount
+        results(offset: $offset, limit: 30) {
+          newName
+          newCategory { id name }
+          newHideFromReports
+          transaction {
+            id
+            date
+            amount
+            merchant { id name }
+            category { id name }
+          }
+        }
+      }
+    }
+    """
+)
+
+CREATE_TRANSACTION_RULE = gql(
+    """
+    mutation Common_CreateTransactionRuleMutationV2($input: CreateTransactionRuleInput!) {
+      createTransactionRuleV2(input: $input) {
+        transactionRule { id }
+        errors { message code fieldErrors { field messages } }
+      }
+    }
+    """
+)
+
+RULE_VERIFY_HINT = "Call get_transaction_rules and check whether the intended rule already exists before retrying."
+
+
+async def _fetch_transaction_rules() -> list[JsonValue]:
+    """Read every transaction rule, in Monarch's priority order."""
+    response = await api_call_with_retry(
+        "gql_call", operation="GetTransactionRules", graphql_query=GET_TRANSACTION_RULES, variables={}
+    )
+    rules: list[JsonValue] = convert_dates_to_strings(extract_list(response, "transactionRules"))
+    return rules
+
+
+def _rule_ids(name: str, ids: list[str] | None) -> list[JsonValue] | None:
+    """None and [] both mean "no filter"; a blank ID inside a supplied list is an error."""
+    if not ids:
+        return None
+    if any(not rule_id.strip() for rule_id in ids):
+        raise ValueError(f"{name} must not contain blank IDs")
+    return [rule_id.strip() for rule_id in ids]
+
+
+def _rule_action_text(name: str, value: str | None) -> str | None:
+    """None leaves the action unset; a blank string is a mistake, not a way to unset it."""
+    if value is None:
+        return None
+    if not value.strip():
+        raise ValueError(f"{name} must not be blank; omit it to leave that action unset")
+    return value.strip()
+
+
+def build_rule_input(
+    *,
+    merchant_criteria: list[RuleTextCriterion] | None,
+    original_statement_criteria: list[RuleTextCriterion] | None,
+    amount_criteria: RuleAmountCriterion | None,
+    account_ids: list[str] | None,
+    category_ids: list[str] | None,
+    set_category_id: str | None,
+    set_merchant_name: str | None,
+    hide_from_reports: bool | None,
+) -> dict[str, JsonValue]:
+    """Validate rule arguments and build the camelCase input Monarch expects.
+
+    Unset fields and empty lists are left out entirely rather than sent as null or [].
+    """
+    rule: dict[str, JsonValue] = {}
+    if merchant_criteria:
+        rule["merchantNameCriteria"] = [criterion.to_input() for criterion in merchant_criteria]
+    if original_statement_criteria:
+        rule["originalStatementCriteria"] = [criterion.to_input() for criterion in original_statement_criteria]
+    if amount_criteria is not None:
+        rule["amountCriteria"] = amount_criteria.to_input()
+    if not rule:
+        raise ValueError(
+            "A rule needs a merchant, original-statement, or amount criterion; "
+            "account_ids and category_ids only narrow a rule and are not enough on their own"
+        )
+
+    accounts = _rule_ids("account_ids", account_ids)
+    if accounts is not None:
+        rule["accountIds"] = accounts
+    categories = _rule_ids("category_ids", category_ids)
+    if categories is not None:
+        rule["categoryIds"] = categories
+
+    # An action is present when it is not None: hide_from_reports=False is a real action.
+    actions: dict[str, JsonValue] = {}
+    category_action = _rule_action_text("set_category_id", set_category_id)
+    if category_action is not None:
+        actions["setCategoryAction"] = category_action
+    merchant_action = _rule_action_text("set_merchant_name", set_merchant_name)
+    if merchant_action is not None:
+        actions["setMerchantAction"] = merchant_action
+    if hide_from_reports is not None:
+        actions["setHideFromReportsAction"] = hide_from_reports
+    if not actions:
+        raise ValueError("A rule needs at least one action: set_category_id, set_merchant_name, or hide_from_reports")
+    rule.update(actions)
+    return rule
+
+
+def _payload_error_reasons(error: JsonValue) -> list[str]:
+    if isinstance(error, str):
+        return [error] if error.strip() else []
+    if not isinstance(error, dict):
+        return []
+    reasons: list[str] = []
+    message = error.get("message")
+    if isinstance(message, str) and message.strip():
+        reasons.append(message)
+    field_errors = error.get("fieldErrors")
+    if isinstance(field_errors, list):
+        for field_error in field_errors:
+            if not isinstance(field_error, dict):
+                continue
+            messages = field_error.get("messages")
+            text = ", ".join(m for m in messages if isinstance(m, str)) if isinstance(messages, list) else ""
+            reasons.append(f"{field_error.get('field')}: {text}" if text else str(field_error.get("field")))
+    return reasons
+
+
+def raise_on_payload_errors(payload: dict[str, JsonValue], what: str) -> None:
+    """Raise if Monarch's mutation payload carries any error.
+
+    ``errors`` is normally a single PayloadError object. A non-null object is a
+    rejection even when every field in it is null: that is how Monarch silently
+    refuses a rule without a criterion or an action.
+    """
+    errors = payload.get("errors")
+    if errors is None:
+        return
+    entries = errors if isinstance(errors, list) else [errors]
+    present = [entry for entry in entries if entry is not None]
+    if not present:
+        return
+    reasons = [reason for entry in present for reason in _payload_error_reasons(entry)]
+    raise ValueError(f"Monarch rejected {what}: {'; '.join(reasons) or 'no reason given'}")
+
+
+async def _read_back_rule(rule_id: str) -> JsonValue | None:
+    """Best-effort lookup of a just-created rule; None when it can't be read or isn't visible yet.
+
+    Only called once the create mutation has succeeded. Catching every ordinary
+    Exception here is a deliberate exception to the "no generic Exception" rule: this
+    read is optional enrichment, and letting any error escape would report a successful
+    create as failed and invite a duplicate-creating retry. BaseException (cancellation,
+    KeyboardInterrupt) still propagates.
+    """
+    try:
+        rules = await _fetch_transaction_rules()
+        return next((rule for rule in rules if isinstance(rule, dict) and rule.get("id") == rule_id), None)
+    except Exception as e:
+        log.warning("transaction_rule_read_back_failed", **safe_error_fields(e))
+        return None
+
+
+@mcp.tool(annotations=READONLY, title="Get Transaction Rules")
+@track_usage
+async def get_transaction_rules() -> TransactionRulesResult:
+    """List every transaction rule, in the priority order Monarch applies them.
+
+    Rules are returned in full, including criteria and actions that
+    create_transaction_rule cannot set (owners, goals, splits, tags, ...), so rules
+    made in the Monarch app show up faithfully.
+    """
+    await ensure_authenticated()
+    rules = await _fetch_transaction_rules()
+    return TransactionRulesResult(rules=rules, count=len(rules))
+
+
+@mcp.tool(annotations=READONLY, title="Preview Transaction Rule")
+@track_usage
+async def preview_transaction_rule(
+    merchant_criteria: list[RuleTextCriterion] | None = None,
+    original_statement_criteria: list[RuleTextCriterion] | None = None,
+    amount_criteria: RuleAmountCriterion | None = None,
+    account_ids: list[str] | None = None,
+    category_ids: list[str] | None = None,
+    set_category_id: str | None = None,
+    set_merchant_name: str | None = None,
+    hide_from_reports: bool | None = None,
+    offset: int = 0,
+) -> RulePreviewResult:
+    """Show which existing transactions a proposed rule would match, without saving anything.
+
+    Call this before create_transaction_rule to check the criteria. It is read-only.
+    Arguments match create_transaction_rule. Each match lists the transaction and the
+    category/merchant/hidden values the rule would give it. Results come 30 at a
+    time; pass offset to page through total_count.
+
+    Example: preview "merchant contains Corner Deli -> category cat_001":
+        merchant_criteria=[{"operator": "contains", "value": "Corner Deli"}]
+        set_category_id="cat_001"
+    """
+    if offset < 0:
+        raise ValueError("offset must be nonnegative")
+    rule = build_rule_input(
+        merchant_criteria=merchant_criteria,
+        original_statement_criteria=original_statement_criteria,
+        amount_criteria=amount_criteria,
+        account_ids=account_ids,
+        category_ids=category_ids,
+        set_category_id=set_category_id,
+        set_merchant_name=set_merchant_name,
+        hide_from_reports=hide_from_reports,
+    )
+    await ensure_authenticated()
+    response = await api_call_with_retry(
+        "gql_call",
+        operation="Common_PreviewTransactionRule",
+        graphql_query=PREVIEW_TRANSACTION_RULE,
+        variables={"rule": rule, "offset": offset},
+    )
+    preview = response.get("transactionRulePreview") if isinstance(response, dict) else None
+    if not isinstance(preview, dict):
+        raise ValueError("Monarch returned an invalid rule preview response")
+    matches: list[JsonValue] = convert_dates_to_strings(extract_list(preview, "results"))
+    total_count = preview.get("totalCount")
+    return RulePreviewResult(
+        total_count=total_count if isinstance(total_count, int) else len(matches),
+        matches=matches,
+    )
+
+
+@mcp.tool(annotations=WRITE_CREATE_MAY_MODIFY, title="Create Transaction Rule")
+@track_usage
+async def create_transaction_rule(
+    merchant_criteria: list[RuleTextCriterion] | None = None,
+    original_statement_criteria: list[RuleTextCriterion] | None = None,
+    amount_criteria: RuleAmountCriterion | None = None,
+    account_ids: list[str] | None = None,
+    category_ids: list[str] | None = None,
+    set_category_id: str | None = None,
+    set_merchant_name: str | None = None,
+    hide_from_reports: bool | None = None,
+    apply_to_existing_transactions: bool = False,
+) -> CreateRuleResult:
+    """Create a transaction rule that Monarch applies to new transactions.
+
+    Call preview_transaction_rule with the same arguments first to see what it matches.
+
+    A rule needs at least one criterion from merchant_criteria,
+    original_statement_criteria, or amount_criteria, plus at least one action.
+    A transaction must match every criterion given; entries within one list are "or".
+
+    Criteria:
+        merchant_criteria: Merchant name text, e.g. [{"operator": "contains", "value": "Corner Deli"}].
+            operator is "contains" (default) or "eq" (exact match).
+        original_statement_criteria: Bank statement text, same shape.
+        amount_criteria: {"operator": "gt"|"lt"|"eq", "value": 20} or
+            {"operator": "between", "lower": 10, "upper": 50}. Amounts have no sign;
+            is_expense=True (default) matches money going out, False money coming in.
+        account_ids / category_ids: Only match transactions in these accounts or
+            current categories. These narrow a rule but can't be its only criteria.
+
+    Actions:
+        set_category_id: Category ID from get_transaction_categories.
+        set_merchant_name: Rename the merchant (a name, not an ID).
+        hide_from_reports: Hide (True) or unhide (False) matching transactions from reports.
+
+    apply_to_existing_transactions=True also rewrites matching past transactions
+    right away, which is hard to undo. It defaults to False.
+
+    Returns the new rule_id and, when it can be read back, the stored rule. A null
+    ``rule`` still means the rule was created.
+
+    If this fails with "may already have been created", call get_transaction_rules
+    and check whether the rule exists before retrying.
+    """
+    require_tool_enabled("create_transaction_rule")
+    rule = build_rule_input(
+        merchant_criteria=merchant_criteria,
+        original_statement_criteria=original_statement_criteria,
+        amount_criteria=amount_criteria,
+        account_ids=account_ids,
+        category_ids=category_ids,
+        set_category_id=set_category_id,
+        set_merchant_name=set_merchant_name,
+        hide_from_reports=hide_from_reports,
+    )
+    # Sent even when False, so the safe default never depends on Monarch's.
+    rule["applyToExistingTransactions"] = apply_to_existing_transactions
+
+    await ensure_authenticated()
+    log.info("creating_transaction_rule", field_count=len(rule), apply_to_existing=apply_to_existing_transactions)
+
+    response = await write_call(
+        "gql_call",
+        creates=True,
+        description="The transaction rule",
+        verification_hint=RULE_VERIFY_HINT,
+        operation="Common_CreateTransactionRuleMutationV2",
+        graphql_query=CREATE_TRANSACTION_RULE,
+        variables={"input": rule},
+    )
+    payload = response.get("createTransactionRuleV2") if isinstance(response, dict) else None
+    if not isinstance(payload, dict):
+        raise WriteOutcomeUnknownError(
+            "The transaction rule may already have been created: Monarch's response could not be "
+            f"read. Do NOT retry blindly -- {RULE_VERIFY_HINT}"
+        )
+    raise_on_payload_errors(payload, "the rule creation")
+
+    created = payload.get("transactionRule")
+    rule_id = created.get("id") if isinstance(created, dict) else None
+    if not isinstance(rule_id, str) or not rule_id:
+        raise WriteOutcomeUnknownError(
+            "The transaction rule may already have been created: Monarch reported no error but "
+            f"returned no rule ID. Do NOT retry blindly -- {RULE_VERIFY_HINT}"
+        )
+
+    # The create has succeeded. Reading it back only enriches the result.
+    stored = await _read_back_rule(rule_id)
+    message = (
+        f"Created rule {rule_id}."
+        if stored is not None
+        else f"Created rule {rule_id}; read-back verification was unavailable or the rule is not visible yet."
+    )
+    return CreateRuleResult(
+        rule_id=rule_id,
+        rule=stored,
+        apply_to_existing_requested=apply_to_existing_transactions,
         message=message,
     )
 

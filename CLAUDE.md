@@ -178,11 +178,12 @@ refactor: split server.py into modular components (auth, tools, models)
 - Structured logging with `structlog` for debugging
 - Environment variables: `MONARCH_EMAIL`, `MONARCH_PASSWORD`, `MONARCH_MFA_SECRET`
 
-**Complete Monarch Money API Coverage (23 Tools)**
+**Complete Monarch Money API Coverage (26 Tools)**
 - **Core**: `get_accounts`, `get_transactions`, `get_budgets`, `get_cashflow`
 - **Categories**: `get_transaction_categories`
 - **Transactions**: `create_transaction`, `update_transaction`, `update_transactions_bulk`, `search_transactions`
 - **Splits**: `get_transaction_splits`, `update_transaction_splits` (full-replace; empty list removes all splits)
+- **Rules**: `get_transaction_rules`, `preview_transaction_rule` (read-only), `create_transaction_rule` (write). The pinned library has no rule methods, so these send raw GraphQL through `gql_call`. The list query mirrors upstream `monarchmoneycommunity` `get_transaction_rules` (dev@62bf8b1). Facts cross-checked against other Monarch clients (jamiew upstream, pulsemcp, robcerda): write merchant matching as `merchantNameCriteria` (not legacy `merchantCriteria`); `setCategoryAction` takes a category ID; `setMerchantAction` takes a merchant *name* (an ID creates a merchant named after it); amounts are unsigned with `isExpense`; a rule needs a merchant/statement/amount criterion (account/category IDs alone are refused); a non-null `errors` object is a rejection even when every field is null. Create success comes from the mutation alone; read-back is best-effort. Update/delete/reorder are not implemented (upstream jamiew has update/delete, which are full-replace and need a re-read to confirm delete). Live checks: `tests/test_integration_rules.py` (verified 2026-09-28: list, preview, and create incl. merchant rename + hide-from-reports; opt-in flags `MONARCH_RUN_INTEGRATION=1`, `MONARCH_RUN_RULE_WRITES=true`, `MONARCH_RUN_RULE_STAGED_PROBE=true`).
 - **Investments**: `get_account_holdings` (requires `account_id`), `get_account_history`
 - **Banking**: `get_institutions`, `refresh_accounts`
 - **Planning**: `get_recurring_transactions`, `set_budget_amount`
@@ -484,7 +485,7 @@ This MCP server is a thin wrapper over a Python Monarch Money client. That clien
 **Unused capabilities in the fork we already depend on** (zero new dependencies — just need new `@mcp.tool()` wrappers in `server.py`): transaction tags (`get/set/create_transaction_tag`), `find_duplicate_transactions`, `get_transaction_details`, `get_cashflow_summary`, `get_subscription_details`, `get_credit_history`, `delete_transaction`, `create_transaction_category`, `update_account`, `request_accounts_refresh_and_wait`, and the newer `upload_receipt_to_inbox` (upload a receipt image → Monarch AI auto-categorizes/matches it).
 
 **`keithah/monarchmoney-enhanced` (cherry-pick, don't switch):** has the bigger surface but is now stale (no push since 2026-01-17) and is **not** a strict superset — switching would lose our fork's `upload_attachment`, `upload_receipt_to_inbox`, `reset_budget`, flex-budget methods, and `get_credit_history`. Capabilities worth porting by lifting the isolated GraphQL queries from its `services/*.py` (ranked by value-per-effort):
-1. **Rules engine** (biggest differentiator — maps to the "category auto-classification" TODO): `create_transaction_rule` + categorization/amount/ignore/combined variants, `preview_transaction_rule`, `apply_rules_to_existing_transactions`, `get/update/delete_transaction_rule`. Self-contained in `transaction_service.py`.
+1. **Rules engine** — *partially ported (list, preview, create; see "Rules" above)* (biggest differentiator — maps to the "category auto-classification" TODO): `create_transaction_rule` + categorization/amount/ignore/combined variants, `preview_transaction_rule`, `apply_rules_to_existing_transactions`, `get/update/delete_transaction_rule`. Self-contained in `transaction_service.py`.
 2. **Net worth history + insights** (maps to "financial intelligence / investment performance" TODOs): `get_net_worth_history`, `get_insights`, `get_investment_performance`, `get_credit_score`. Isolated in `insight_service.py` / `investment_service.py`.
 3. **Goals & Bills**: `get_goals`/`create_goal`/…, `get_bills` — small isolated query sets, common personal-finance value.
 

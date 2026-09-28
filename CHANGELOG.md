@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Transaction rules
+
+- new `get_transaction_rules`, `preview_transaction_rule`, and `create_transaction_rule` tools (26 tools total). Rules can match on merchant name, original statement text, or amount (optionally narrowed to accounts or current categories) and set a category, rename the merchant, or hide from reports. Update, delete, and reordering are not supported yet.
+- `get_transaction_rules` returns rules in full, including criteria and actions this server can't create (owners, goals, splits, tags), so rules made in the Monarch app show up faithfully.
+- `create_transaction_rule` is a write tool (gated by `MONARCH_ENABLE_WRITES`). It never applies a rule to past transactions unless `apply_to_existing_transactions=True`, and it reports success from Monarch's response alone. Reading the new rule back is best-effort. An ambiguous failure tells the client to check `get_transaction_rules` before retrying.
+- `gql` is now a direct dependency (unchanged at 4.0.0).
+
 ### Remote deployment over Streamable HTTP
 
 - new `--transport http` mode (or `MONARCH_TRANSPORT=http`): stateless Streamable HTTP on `/mcp` plus a minimal `GET /healthz`, always-on Host/Origin (DNS-rebinding) validation driven by `MONARCH_ALLOWED_HOSTS`, and a request-body cap. stdio is unchanged and remains the default.

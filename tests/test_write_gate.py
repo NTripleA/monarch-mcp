@@ -28,6 +28,10 @@ WRITE_ARGS: dict[str, dict[str, Any]] = {
     "set_budget_amount": {"category_id": "cat_1", "amount": 100.0},
     "create_manual_account": {"account_name": "Savings", "account_type": "depository", "account_sub_type": "savings"},
     "refresh_accounts": {},
+    "create_transaction_rule": {
+        "merchant_criteria": [{"operator": "contains", "value": "Corner Deli"}],
+        "set_category_id": "cat_1",
+    },
 }
 
 
@@ -74,6 +78,14 @@ class TestWriteToolInventory:
         annotations = server.mcp._tool_manager.get_tool(name).annotations
         assert annotations.readOnlyHint is False
         assert annotations.destructiveHint is False
+        assert annotations.idempotentHint is False
+
+    def test_rule_creation_is_destructive_and_not_idempotent(self) -> None:
+        # A new rule can rewrite past transactions (apply_to_existing_transactions), and
+        # repeating the call creates a second rule.
+        annotations = server.mcp._tool_manager.get_tool("create_transaction_rule").annotations
+        assert annotations.readOnlyHint is False
+        assert annotations.destructiveHint is True
         assert annotations.idempotentHint is False
 
 
@@ -133,7 +145,7 @@ class TestToolListing:
         server.configure_runtime("http")
         listed = await listed_tools()
         assert listed == ALL_TOOLS - server.WRITE_TOOLS - server.LOCAL_ONLY_TOOLS
-        assert len(listed) == 15
+        assert len(listed) == 17
 
 
 class TestDispatchGate:

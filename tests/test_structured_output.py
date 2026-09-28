@@ -21,8 +21,8 @@ def test_every_tool_advertises_output_schema() -> None:
     assert without_schema == []
 
 
-def test_tool_count_is_twenty_three() -> None:
-    assert len(mgr.list_tools()) == 23
+def test_tool_count_is_twenty_six() -> None:
+    assert len(mgr.list_tools()) == 26
 
 
 @pytest.mark.parametrize(
@@ -33,6 +33,9 @@ def test_tool_count_is_twenty_three() -> None:
         ("get_spending_summary", {"period", "group_by", "groups", "totals"}),
         ("update_transactions_bulk", {"summary", "results", "message"}),
         ("get_complete_financial_overview", {"period", "accounts", "transaction_summary"}),
+        ("get_transaction_rules", {"rules", "count"}),
+        ("preview_transaction_rule", {"total_count", "matches"}),
+        ("create_transaction_rule", {"rule_id", "rule", "apply_to_existing_requested", "message"}),
     ],
 )
 def test_output_schema_declares_expected_properties(tool_name: str, schema_props: set[str]) -> None:
