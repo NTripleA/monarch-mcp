@@ -178,11 +178,12 @@ refactor: split server.py into modular components (auth, tools, models)
 - Structured logging with `structlog` for debugging
 - Environment variables: `MONARCH_EMAIL`, `MONARCH_PASSWORD`, `MONARCH_MFA_SECRET`
 
-**Complete Monarch Money API Coverage (23 Tools)**
+**Complete Monarch Money API Coverage (26 Tools)**
 - **Core**: `get_accounts`, `get_transactions`, `get_budgets`, `get_cashflow`
 - **Categories**: `get_transaction_categories`
 - **Transactions**: `create_transaction`, `update_transaction`, `update_transactions_bulk`, `search_transactions`
 - **Splits**: `get_transaction_splits`, `update_transaction_splits` (full-replace; empty list removes all splits)
+- **Rules**: `get_transaction_rules`, `preview_transaction_rule` (read-only), `create_transaction_rule` (write). The pinned library has no rule methods, so these send raw GraphQL through `gql_call`. The list query mirrors upstream `monarchmoneycommunity` `get_transaction_rules` (dev@62bf8b1). Facts cross-checked against other Monarch clients (jamiew upstream, pulsemcp, robcerda): write merchant matching as `merchantNameCriteria` (not legacy `merchantCriteria`); `setCategoryAction` takes a category ID; `setMerchantAction` takes a merchant *name* (an ID creates a merchant named after it); amounts are unsigned with `isExpense`; a rule needs a merchant/statement/amount criterion (account/category IDs alone are refused); a non-null `errors` object is a rejection even when every field is null. Create success comes from the mutation alone; read-back is best-effort. Update/delete/reorder are not implemented (upstream jamiew has update/delete, which are full-replace and need a re-read to confirm delete). Live checks: `tests/test_integration_rules.py` (verified 2026-09-28: list, preview, and create incl. merchant rename + hide-from-reports; opt-in flags `MONARCH_RUN_INTEGRATION=1`, `MONARCH_RUN_RULE_WRITES=true`, `MONARCH_RUN_RULE_STAGED_PROBE=true`).
 - **Investments**: `get_account_holdings` (requires `account_id`), `get_account_history`
 - **Banking**: `get_institutions`, `refresh_accounts`
 - **Planning**: `get_recurring_transactions`, `set_budget_amount`
@@ -469,22 +470,25 @@ window before an MFA retry rather than replaying a code Monarch has already cons
 
 ## Upstream Library & Fork Landscape
 
-**Last checked: 2026-06-30.** Update the date and findings below whenever you re-analyze (see "How to keep this current").
+**Last checked: `monarchmoneycommunity` row and our pin 2026-09-28; `hammem` and `keithah` rows 2026-06-30.** Update the dates and findings below whenever you re-analyze (see "How to keep this current").
 
 This MCP server is a thin wrapper over a Python Monarch Money client. That client is a *fork of a fork*, so it's worth understanding the lineage:
 
 | Repo | Role | Stars | Health (as of last check) |
 |---|---|---|---|
 | [`hammem/monarchmoney`](https://github.com/hammem/monarchmoney) | original parent | ~502 | **Still effectively abandoned.** Last commit 2025-11-03 (~8 months stale), not archived. Top open items are the same domain-change saga (`api.monarchmoney.com` → `api.monarch.com`); our fork already carries it. No new critical fixes we lack. Do **not** depend on this directly. |
-| [`bradleyseanf/monarchmoneycommunity`](https://github.com/bradleyseanf/monarchmoneycommunity) | **what we use** | ~95 | **Most active fork by far.** `dev` last commit 2026-06-13, ahead 8 / behind 0 vs `main`. Carries the domain fix, gql 4.0 fix, auth persistence, budget query fix, plus newer cookie-auth fallback and `upload_receipt_to_inbox`. PyPI `monarchmoneycommunity` 1.4.0. |
+| [`bradleyseanf/monarchmoneycommunity`](https://github.com/bradleyseanf/monarchmoneycommunity) | **what we use** | ~153 | **Most active fork by far.** `dev` HEAD `62bf8b1` (2026-09-25), ahead 2 / behind 1 vs `main`. Carries the domain fix, gql 4.0 fix, auth persistence, budget query fix, cookie-auth fallback, `upload_receipt_to_inbox`, and (newer than our pin) a native `get_transaction_rules`. PyPI `monarchmoneycommunity` 1.6.0. |
 | [`keithah/monarchmoney-enhanced`](https://github.com/keithah/monarchmoney-enhanced) | sibling fork, **not used** | ~24 | **Gone stale** — last push 2026-01-17 (~5.5 months). Still the most feature-rich sibling (~126 public methods, service-oriented ~6,100 LOC + modules vs our single ~3,960-LOC file), on PyPI as `monarchmoney-enhanced` 0.11.0. The activity gap now favors cherry-picking from it over switching to it. |
 
-**Our pin:** `pyproject.toml` → `[tool.uv.sources]` pins `monarchmoneycommunity` to a **specific commit SHA** (the fork's `dev` HEAD), not a moving branch, for reproducible builds. As of this check the pin (`c6904e4`) **equals dev HEAD** — we track the tip. When bumping, update the SHA *and* the comment date there.
+**Our pin:** `pyproject.toml` → `[tool.uv.sources]` pins `monarchmoneycommunity` to a **specific commit SHA**, not a moving branch, for reproducible builds.
+- **Pinned version: `c6904e4`**, an intentionally kept known-good commit (it was `dev` HEAD on 2026-06-30). As of 2026-09-28 it is **behind** upstream: `dev` HEAD `62bf8b1` is 79 commits ahead, and the pin is an ancestor of it (behind 0).
+- **Newer upstream used only as a reference: `dev@62bf8b1`.** The transaction-rule tools copy its `get_transaction_rules` GraphQL into `server.py` and send it through the pinned library's `gql_call`, instead of bumping the pin.
+- Upstream `jamiew/monarch-mcp` has moved its pin to `d30f285`. Bumping ours is a separate decision: re-run the full suite plus the opt-in live tests when doing it, and update the SHA *and* the comment in `pyproject.toml`.
 
 **Unused capabilities in the fork we already depend on** (zero new dependencies — just need new `@mcp.tool()` wrappers in `server.py`): transaction tags (`get/set/create_transaction_tag`), `find_duplicate_transactions`, `get_transaction_details`, `get_cashflow_summary`, `get_subscription_details`, `get_credit_history`, `delete_transaction`, `create_transaction_category`, `update_account`, `request_accounts_refresh_and_wait`, and the newer `upload_receipt_to_inbox` (upload a receipt image → Monarch AI auto-categorizes/matches it).
 
-**`keithah/monarchmoney-enhanced` (cherry-pick, don't switch):** has the bigger surface but is now stale (no push since 2026-01-17) and is **not** a strict superset — switching would lose our fork's `upload_attachment`, `upload_receipt_to_inbox`, `reset_budget`, flex-budget methods, and `get_credit_history`. Capabilities worth porting by lifting the isolated GraphQL queries from its `services/*.py` (ranked by value-per-effort):
-1. **Rules engine** (biggest differentiator — maps to the "category auto-classification" TODO): `create_transaction_rule` + categorization/amount/ignore/combined variants, `preview_transaction_rule`, `apply_rules_to_existing_transactions`, `get/update/delete_transaction_rule`. Self-contained in `transaction_service.py`.
+**`keithah/monarchmoney-enhanced` (cherry-pick, don't switch):** has the bigger surface but is now stale (no push since 2026-01-17) and is **not** a strict superset — switching would lose our fork's `upload_attachment`, `upload_receipt_to_inbox`, `reset_budget`, flex-budget methods, and `get_credit_history`. Capabilities worth porting by lifting the isolated GraphQL queries from its `services/*.py` (ranked by value-per-effort; verify each against the live API, since its services layer is not always Monarch's real schema):
+1. **Rules engine** — *partially ported (list, preview, create; see "Rules" above).* **Do not port rules from this fork**: its `services/transaction_service.py` uses a generic name/priority/isEnabled/conditions/actions schema that is not Monarch's live `TransactionRuleV2` schema (rejected during the rules work). For future rule update/delete/reorder: prefer the live-tested implementation in upstream `jamiew/monarch-mcp` (`update_transaction_rule` re-sends the full rule because updates are full-replace; `delete_transaction_rule` confirms by re-reading because the `deleted` flag is unreliable), keep this fork's `WRITE_TOOLS` gate / `require_tool_enabled` / `write_call` hardening, and use other captured clients (pulsemcp, robcerda, this fork's `monarchmoney.py`) only as corroboration.
 2. **Net worth history + insights** (maps to "financial intelligence / investment performance" TODOs): `get_net_worth_history`, `get_insights`, `get_investment_performance`, `get_credit_score`. Isolated in `insight_service.py` / `investment_service.py`.
 3. **Goals & Bills**: `get_goals`/`create_goal`/…, `get_bills` — small isolated query sets, common personal-finance value.
 

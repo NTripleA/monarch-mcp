@@ -9,7 +9,7 @@ Built on the [`monarchmoneycommunity`](https://github.com/bradleyseanf/monarchmo
 
 ## Features
 
-- **Tools** covering accounts, transactions, budgets, cashflow, investments, categories, recurring transactions, and spending analysis
+- **Tools** covering accounts, transactions, transaction rules, budgets, cashflow, investments, categories, recurring transactions, and spending analysis
 - **Structured output** — every tool returns a typed schema (`outputSchema` + machine-readable structured content) with a text fallback for older clients
 - **MCP resources** for quick access to categories, accounts, and institutions, plus parameterized templates for per-account holdings and history (`accounts://{account_id}/holdings|history`)
 - **MCP prompts** for guided financial analysis workflows, with live argument autocompletion
@@ -225,6 +225,9 @@ Treat this string like a password: it grants full account access until the sessi
 | `create_transaction` | Create a manual transaction |
 | `update_transaction` | Update a single transaction |
 | `update_transactions_bulk` | Update multiple transactions in parallel |
+| `get_transaction_rules` | List automation rules in priority order, in full |
+| `preview_transaction_rule` | Show which transactions a proposed rule would match (read-only) |
+| `create_transaction_rule` | Create a rule, e.g. "merchant contains X → set category Y" |
 | `get_budgets` | Budget data and spending analysis |
 | `get_cashflow` | Income and expense analysis |
 | `get_account_holdings` | Investment holdings for an account (requires `account_id`) |

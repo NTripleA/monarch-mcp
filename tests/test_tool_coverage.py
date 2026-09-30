@@ -72,6 +72,19 @@ TOOL_CALLS: list[Any] = [
     ),
     pytest.param(lambda: server.get_spending_summary(), id="get_spending_summary"),
     pytest.param(lambda: server.refresh_accounts(), id="refresh_accounts"),
+    pytest.param(lambda: server.get_transaction_rules(), id="get_transaction_rules"),
+    pytest.param(
+        lambda: server.preview_transaction_rule(
+            merchant_criteria=[server.RuleTextCriterion(value="Corner Deli")], set_category_id="cat_1"
+        ),
+        id="preview_transaction_rule",
+    ),
+    pytest.param(
+        lambda: server.create_transaction_rule(
+            merchant_criteria=[server.RuleTextCriterion(value="Corner Deli")], set_category_id="cat_1"
+        ),
+        id="create_transaction_rule",
+    ),
 ]
 
 RESOURCE_CALLS: list[Any] = [
