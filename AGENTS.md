@@ -154,16 +154,18 @@ tail -f <mcp-client-log> | grep "\[RESULT_SIZE\]" | grep -E "[5-9][0-9]\.[0-9]+ 
 - Monarch GraphQL responses are dicts (e.g. `{"accounts": [...]}`), not bare lists. Use `extract_list(response, key)` (or `extract_transactions_list`) to unwrap the inner list before counting or mapping it.
 - `convert_dates_to_strings()` guarantees clean JSON serialization.
 
-### Tool Coverage (22 Tools, 5 Resources, 4 Prompts)
+### Tool Coverage (26 Tools, 5 Resources, 4 Prompts)
 - **Core:** `get_accounts`, `get_transactions`, `get_budgets`, `get_cashflow`
 - **Categories:** `get_transaction_categories`
 - **Transactions:** `create_transaction`, `update_transaction`, `update_transactions_bulk`, `search_transactions`
+- **Rules:** `get_transaction_rules`, `preview_transaction_rule`, `create_transaction_rule`
 - **Splits:** `get_transaction_splits`, `update_transaction_splits` (full-replace; empty list removes all splits)
 - **Investments:** `get_account_holdings` (requires `account_id`), `get_account_history`
 - **Banking:** `get_institutions`, `refresh_accounts`
 - **Planning:** `get_recurring_transactions`, `set_budget_amount`
 - **Manual Accounts:** `create_manual_account`
 - **Auth:** `authenticate_browser_session` (browser sign-in via MCP `elicit_url`; captures cookies via loopback server)
+- **Diagnostics:** `monarch_auth_status` (safe session and transport status)
 - **Batch Operations:** `get_spending_summary`, `update_transactions_bulk`
 - **Intelligent Analysis:** `get_complete_financial_overview`, `analyze_spending_patterns`
 - **Resources:** 3 static lists + 2 parameterized templates (`accounts://{account_id}/holdings|history`).
@@ -277,8 +279,8 @@ Update this file when:
 ## Status, Metrics & Implementation Roadmap
 
 ### Production Quality Metrics
-- **Tests:** 206+ passing tests across unit, integration, and mock suites.
-- **Tools:** 22 typed tools returning Pydantic models (structured output).
+- **Tests:** 583 passing offline tests; 11 live-account tests skipped. Verified locally on Python 3.13.5 for the correctness backport.
+- **Tools:** 26 typed tools returning Pydantic models (structured output).
 - **Resources:** 3 static resources + 2 parameterized templates (`accounts://{account_id}/holdings|history`).
 - **Prompts:** 4 prompt templates with argument completions.
 - **Type Checking:** 100% clean under strict MyPy configuration.
@@ -289,6 +291,7 @@ Update this file when:
 - **Phase 2 (Advanced Features):** Bulk transaction updates (`update_transactions_bulk`), natural language date parsing, smart spending aggregations (`get_spending_summary`), `@track_usage` analytics, financial overview (`get_complete_financial_overview`), spending pattern forecasting (`analyze_spending_patterns`).
 - **Phase 3 (Production Stability):** JSON-RPC stdio protocol compliance, stdout suppression, third-party log silencing, session recovery, comprehensive testing.
 - **Phase 4a (Critical Resilience):** Date serialization fixes (ISO strings), broken pipe handlers, dependency updates, browser auth loopback (`authenticate_browser_session`).
+- **Correctness backports:** All-page spending summaries, transfer exclusions, calendar-period date bounds, recent-complete-month forecasts, mutation-response checks, and finite amounts. Preserve `write_call`, whole-batch validation, the HTTP write gate, session-only authentication, privacy filters, and the separate strict rule validators when extending these paths. The overview and spending-pattern tools still use bounded transaction samples and report truncation in metadata.
 
 ### Remaining Priorities
 

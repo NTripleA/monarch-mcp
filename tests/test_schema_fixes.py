@@ -24,9 +24,14 @@ class TestUpdateTransactionSchema:
         with patch("server.ensure_authenticated", new_callable=AsyncMock):
             with patch("server.api_call_with_retry", new_callable=AsyncMock) as mock_api:
                 mock_api.return_value = {
-                    "id": "txn_123",
-                    "merchant": {"name": "New Merchant Name"},
-                    "amount": -50.00,
+                    "updateTransaction": {
+                        "transaction": {
+                            "id": "txn_123",
+                            "merchant": {"name": "New Merchant Name"},
+                            "amount": -50.00,
+                        },
+                        "errors": None,
+                    }
                 }
 
                 result = await update_transaction(transaction_id="txn_123", merchant_name="New Merchant Name")
@@ -43,7 +48,9 @@ class TestUpdateTransactionSchema:
         """Test goal_id parameter for savings goals."""
         with patch("server.ensure_authenticated", new_callable=AsyncMock):
             with patch("server.api_call_with_retry", new_callable=AsyncMock) as mock_api:
-                mock_api.return_value = {"id": "txn_123", "goal": {"id": "goal_456"}}
+                mock_api.return_value = {
+                    "updateTransaction": {"transaction": {"id": "txn_123", "goal": {"id": "goal_456"}}, "errors": None}
+                }
 
                 result = await update_transaction(transaction_id="txn_123", goal_id="goal_456")
 
@@ -56,7 +63,9 @@ class TestUpdateTransactionSchema:
         """Test hide_from_reports boolean parameter."""
         with patch("server.ensure_authenticated", new_callable=AsyncMock):
             with patch("server.api_call_with_retry", new_callable=AsyncMock) as mock_api:
-                mock_api.return_value = {"id": "txn_123", "hideFromReports": True}
+                mock_api.return_value = {
+                    "updateTransaction": {"transaction": {"id": "txn_123", "hideFromReports": True}, "errors": None}
+                }
 
                 result = await update_transaction(transaction_id="txn_123", hide_from_reports=True)
 
@@ -69,7 +78,9 @@ class TestUpdateTransactionSchema:
         """Test needs_review boolean parameter."""
         with patch("server.ensure_authenticated", new_callable=AsyncMock):
             with patch("server.api_call_with_retry", new_callable=AsyncMock) as mock_api:
-                mock_api.return_value = {"id": "txn_123", "needsReview": False}
+                mock_api.return_value = {
+                    "updateTransaction": {"transaction": {"id": "txn_123", "needsReview": False}, "errors": None}
+                }
 
                 result = await update_transaction(transaction_id="txn_123", needs_review=False)
 
@@ -82,7 +93,7 @@ class TestUpdateTransactionSchema:
         """Test all new parameters can be used together."""
         with patch("server.ensure_authenticated", new_callable=AsyncMock):
             with patch("server.api_call_with_retry", new_callable=AsyncMock) as mock_api:
-                mock_api.return_value = {"id": "txn_123"}
+                mock_api.return_value = {"updateTransaction": {"transaction": {"id": "txn_123"}, "errors": None}}
 
                 result = await update_transaction(
                     transaction_id="txn_123",
@@ -109,7 +120,12 @@ class TestCreateTransactionSchema:
         """Verify merchant_name is used (not description)."""
         with patch("server.ensure_authenticated", new_callable=AsyncMock):
             with patch("server.api_call_with_retry", new_callable=AsyncMock) as mock_api:
-                mock_api.return_value = {"id": "txn_new", "merchant": {"name": "Test Merchant"}}
+                mock_api.return_value = {
+                    "createTransaction": {
+                        "transaction": {"id": "txn_new", "merchant": {"name": "Test Merchant"}},
+                        "errors": None,
+                    }
+                }
 
                 result = await create_transaction(
                     amount=-25.00,
@@ -130,7 +146,7 @@ class TestCreateTransactionSchema:
         """Test new update_balance parameter."""
         with patch("server.ensure_authenticated", new_callable=AsyncMock):
             with patch("server.api_call_with_retry", new_callable=AsyncMock) as mock_api:
-                mock_api.return_value = {"id": "txn_new"}
+                mock_api.return_value = {"createTransaction": {"transaction": {"id": "txn_new"}, "errors": None}}
 
                 result = await create_transaction(
                     amount=-100.00,
@@ -268,7 +284,7 @@ class TestBulkUpdateTransactions:
         """Test bulk update with merchant_name field."""
         with patch("server.ensure_authenticated", new_callable=AsyncMock):
             with patch("server.api_call_with_retry", new_callable=AsyncMock) as mock_api:
-                mock_api.return_value = {"id": "txn_123"}
+                mock_api.return_value = {"updateTransaction": {"transaction": {"id": "txn_123"}, "errors": None}}
 
                 updates_json = json.dumps(
                     [
@@ -291,7 +307,7 @@ class TestBulkUpdateTransactions:
         """Test bulk update with all new fields."""
         with patch("server.ensure_authenticated", new_callable=AsyncMock):
             with patch("server.api_call_with_retry", new_callable=AsyncMock) as mock_api:
-                mock_api.return_value = {"id": "txn_123"}
+                mock_api.return_value = {"updateTransaction": {"transaction": {"id": "txn_123"}, "errors": None}}
 
                 updates_json = json.dumps(
                     [

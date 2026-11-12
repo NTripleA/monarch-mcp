@@ -8,6 +8,7 @@ import functools
 import io
 import json
 import logging
+import math
 import os
 import pickle
 import re
@@ -59,9 +60,11 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    FiniteFloat,
     JsonValue,
     StrictBool,
     StrictStr,
+    TypeAdapter,
     ValidationError,
     field_validator,
     model_validator,
@@ -173,98 +176,112 @@ def require_tool_enabled(name: str) -> None:
         raise ToolDisabledError(reason)
 
 
-def parse_flexible_date(date_input: str) -> date:
-    """
-    Parse flexible date inputs including natural language with comprehensive error handling.
+def _named_period(date_input: str, today: date) -> tuple[date, date] | None:
+    """Return the first and last day of a named period, or None for other input."""
+    if date_input in ("today", "now"):
+        return today, today
+    if date_input == "yesterday":
+        day = today - timedelta(days=1)
+        return day, day
+    if date_input in ("this month", "current month"):
+        start = today.replace(day=1)
+        return start, start + relativedelta(months=1, days=-1)
+    if date_input in ("last month", "previous month"):
+        start = today.replace(day=1) - relativedelta(months=1)
+        return start, start + relativedelta(months=1, days=-1)
+    if date_input in ("this year", "current year"):
+        return date(today.year, 1, 1), date(today.year, 12, 31)
+    if date_input in ("last year", "previous year"):
+        return date(today.year - 1, 1, 1), date(today.year - 1, 12, 31)
+    if date_input == "this week":
+        start = today - timedelta(days=today.weekday())
+        return start, start + timedelta(days=6)
+    if date_input == "last week":
+        # Earlier releases treated this as the single day a week ago.
+        day = today - timedelta(days=7)
+        return day, day
+    return None
 
-    Supports:
-    - "today", "now"
-    - "yesterday"
-    - "this month", "current month"
-    - "last month", "previous month"
-    - "this year", "current year"
-    - "last year", "previous year"
-    - "last week", "this week"
-    - "30 days ago", "6 months ago"
-    - Any date format supported by dateutil.parser
+
+def _parsed_period(date_input: str, today: date) -> tuple[date, date]:
+    """Parse a date, widening year-only and month-only input to the whole period."""
+    # Parsing with two defaults reveals omitted fields: "2024-02" fills day 1 and
+    # day 29 (dateutil clamps to the month's end), while a full date is unaffected.
+    first = date_parser.parse(date_input, default=datetime(today.year, 1, 1)).date()
+    last = date_parser.parse(date_input, default=datetime(today.year, 12, 31)).date()
+    whole_month = first.day == 1 and last == first + relativedelta(months=1, days=-1)
+    whole_year = first == date(first.year, 1, 1) and last == date(first.year, 12, 31)
+    if first == last or whole_month or whole_year:
+        return first, last
+    # Other omissions, such as "15" or "monday", resolve relative to today.
+    day = date_parser.parse(date_input, default=datetime(today.year, today.month, today.day)).date()
+    return day, day
+
+
+def parse_date_period(date_input: str) -> tuple[date, date]:
+    """Resolve a date phrase to the first and last day it covers.
+
+    Named periods ("last month") and partial dates ("2024", "2024-02", "January 2024")
+    cover several days; full dates, "today", and relative dates cover one.
     """
     if not date_input:
         raise ValueError("Date input cannot be empty")
 
-    # Handle common natural language patterns
     date_input = date_input.lower().strip()
     today = date.today()
 
-    if date_input in ["today", "now"]:
-        return today
-    elif date_input == "yesterday":
-        return today - timedelta(days=1)
-    elif date_input in ["this month", "current month"]:
-        return date(today.year, today.month, 1)
-    elif date_input in ["last month", "previous month"]:
-        # Handle month rollover correctly
-        if today.month == 1:
-            return date(today.year - 1, 12, 1)
-        else:
-            return date(today.year, today.month - 1, 1)
-    elif date_input in ["this year", "current year"]:
-        return date(today.year, 1, 1)
-    elif date_input in ["last year", "previous year"]:
-        return date(today.year - 1, 1, 1)
-    elif date_input == "last week":
-        return today - timedelta(days=7)
-    elif date_input == "this week":
-        # Start of this week (Monday)
-        days_since_monday = today.weekday()
-        return today - timedelta(days=days_since_monday)
+    named = _named_period(date_input, today)
+    if named is not None:
+        return named
 
-    # Handle relative patterns like "30 days ago", "6 months ago"
     relative_pattern = re.match(r"(\d+)\s+(days?|weeks?|months?|years?)\s+ago", date_input)
     if relative_pattern:
         amount = int(relative_pattern.group(1))
-        unit = relative_pattern.group(2).rstrip("s")  # Remove plural 's'
-
+        unit = relative_pattern.group(2).rstrip("s")
         try:
             if unit == "day":
-                return today - timedelta(days=amount)
+                day = today - timedelta(days=amount)
             elif unit == "week":
-                return today - timedelta(weeks=amount)
+                day = today - timedelta(weeks=amount)
             elif unit == "month":
-                result = today - relativedelta(months=amount)
-                return result.date() if hasattr(result, "date") else result
-            elif unit == "year":
-                result = today - relativedelta(years=amount)
-                return result.date() if hasattr(result, "date") else result
+                day = today - relativedelta(months=amount)
+            else:
+                day = today - relativedelta(years=amount)
         except (ValueError, OverflowError) as e:
             log.warning("Invalid relative date calculation", input=date_input, amount=amount, unit=unit, error=str(e))
             raise ValueError(f"Invalid relative date: {date_input}") from e
+        return day, day
 
-    # Try parsing with dateutil for standard date formats
     try:
-        parsed_datetime = date_parser.parse(date_input)
-        parsed_date = parsed_datetime.date()
-
-        # Validate reasonable date range (1900 to 50 years in future)
-        min_date = date(1900, 1, 1)
-        max_date = date(today.year + 50, 12, 31)
-
-        if parsed_date < min_date or parsed_date > max_date:
-            log.warning("Date outside reasonable range", input=date_input, parsed_date=parsed_date.isoformat())
-            raise ValueError(f"Date {parsed_date.isoformat()} is outside reasonable range (1900-{today.year + 50})")
-
-        return parsed_date
-
+        first, last = _parsed_period(date_input, today)
     except (ValueError, TypeError, OverflowError) as e:
         log.warning("Failed to parse date with dateutil", input=date_input, error=str(e))
 
-        # Provide helpful error message with suggestions
         suggestions = [
-            "Try formats like: 2024-01-15, Jan 15 2024, 15/01/2024",
+            "Try formats like: 2024-01-15, Jan 15 2024, 01/15/2024 (month first), 2024-01, 2024",
             "Or natural language: today, yesterday, last month, this year",
             "Or relative: 30 days ago, 6 months ago, 1 year ago",
         ]
         suggestion_text = ". ".join(suggestions)
         raise ValueError(f"Could not parse date '{date_input}'. {suggestion_text}") from e
+
+    min_date = date(1900, 1, 1)
+    max_date = date(today.year + 50, 12, 31)
+    if first < min_date or last > max_date:
+        log.warning("Date outside reasonable range", input=date_input, parsed_date=first.isoformat())
+        raise ValueError(f"Date {first.isoformat()} is outside reasonable range (1900-{today.year + 50})")
+
+    return first, last
+
+
+def parse_flexible_date(date_input: str) -> date:
+    """Parse a start date: the first day of a named period or partial date."""
+    return parse_date_period(date_input)[0]
+
+
+def parse_flexible_end_date(date_input: str) -> date:
+    """Parse an end date: the last day of a named period or partial date."""
+    return parse_date_period(date_input)[1]
 
 
 def parse_iso_date(value: str, field: str) -> str:
@@ -276,78 +293,27 @@ def parse_iso_date(value: str, field: str) -> str:
 
 
 def build_date_filter(start_date: str | None, end_date: str | None) -> dict[str, str]:
+    """Build ISO date filters; reject unparseable or reversed ranges.
+
+    Periods such as "last month" or "2024" start on their first day and end on
+    their last. Monarch requires both dates or neither. A missing end defaults
+    to today; a missing start to the first day of the end period's first month.
     """
-    Build date filter dictionary with flexible parsing and comprehensive error recovery.
+    if not start_date and not end_date:
+        return {}
 
-    Args:
-        start_date: Start date string (flexible format supported)
-        end_date: End date string (flexible format supported)
+    today = date.today()
+    end_first, end = parse_date_period(end_date) if end_date else (today, today)
+    start = parse_flexible_date(start_date) if start_date else end_first.replace(day=1)
 
-    Returns:
-        Dictionary with ISO format date strings
+    if start > end:
+        log.warning("Start date is after end date", start_date=start.isoformat(), end_date=end.isoformat())
+        raise ValueError(f"Start date ({start.isoformat()}) cannot be after end date ({end.isoformat()})")
 
-    Raises:
-        ValueError: If date parsing fails completely after all fallback attempts
-
-    Note:
-        Monarch Money API requires BOTH start_date AND end_date when filtering by date.
-        If only one is provided, the other will be auto-filled with a sensible default:
-        - Missing end_date: defaults to today
-        - Missing start_date: defaults to start of current month
-    """
-    filters: dict[str, str] = {}
-
-    # Auto-fill missing dates for better UX (Monarch API requires both or neither)
-    if start_date and not end_date:
-        # User provided start but not end - default end to today
-        end_date = "today"
-        log.info("Auto-filling missing end_date with 'today'", start_date=start_date)
-    elif end_date and not start_date:
-        # User provided end but not start - need to parse end_date first to choose smart default
-        # If end_date is in the past, use beginning of that month; otherwise use this month
-        try:
-            parsed_end = parse_flexible_date(end_date)
-            today = date.today()
-
-            # If end date is in the past or in a different month, use first of that month
-            if parsed_end < today or parsed_end.month != today.month or parsed_end.year != today.year:
-                # Use first day of the end_date's month
-                start_date = date(parsed_end.year, parsed_end.month, 1).isoformat()
-                log.info(
-                    "Auto-filling missing start_date with first of end_date's month",
-                    end_date=end_date,
-                    calculated_start=start_date,
-                )
-            else:
-                # End date is this month, use "this month"
-                start_date = "this month"
-                log.info("Auto-filling missing start_date with 'this month'", end_date=end_date)
-        except ValueError:
-            # If we can't parse end_date yet, just use "this month" and let validation catch issues later
-            start_date = "this month"
-            log.info("Auto-filling missing start_date with 'this month' (end_date parse pending)", end_date=end_date)
-
-    # parse_flexible_date already handles all formats (natural language, ISO, dateutil)
-    if start_date:
-        parsed_date = parse_flexible_date(start_date)
-        filters["start_date"] = parsed_date.isoformat()
-        log.info("Parsed start_date", input=start_date, parsed=parsed_date.isoformat())
-
-    if end_date:
-        parsed_date = parse_flexible_date(end_date)
-        filters["end_date"] = parsed_date.isoformat()
-        log.info("Parsed end_date", input=end_date, parsed=parsed_date.isoformat())
-
-    # Validate date range logic
-    if "start_date" in filters and "end_date" in filters:
-        start = date.fromisoformat(filters["start_date"])
-        end = date.fromisoformat(filters["end_date"])
-
-        if start > end:
-            log.warning("Start date is after end date", start_date=filters["start_date"], end_date=filters["end_date"])
-            raise ValueError(f"Start date ({filters['start_date']}) cannot be after end date ({filters['end_date']})")
-
-    return filters
+    log.info(
+        "Parsed date range", start_input=start_date, end_input=end_date, start=start.isoformat(), end=end.isoformat()
+    )
+    return {"start_date": start.isoformat(), "end_date": end.isoformat()}
 
 
 def convert_dates_to_strings(obj: Any) -> Any:
@@ -866,6 +832,63 @@ class MMModel(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+def _transactions_total(response: object) -> int | None:
+    """Return allTransactions.totalCount, or None when Monarch omits it."""
+    if isinstance(response, dict):
+        transactions = response.get("allTransactions")
+        if isinstance(transactions, dict):
+            total = transactions.get("totalCount")
+            if isinstance(total, int) and not isinstance(total, bool):
+                return total
+    return None
+
+
+def _transactions_truncated(response: object, returned: int) -> bool | None:
+    total = _transactions_total(response)
+    return total > returned if total is not None else None
+
+
+def _transaction_paging(response: object, offset: int, limit: int, returned: int) -> tuple[int | None, int | None]:
+    """Return (total_count, next_offset) for one transaction page."""
+    total = _transactions_total(response)
+    # Without a total, a full page is the only hint that more rows exist.
+    more = returned > 0 and (offset + returned < total if total is not None else returned == limit)
+    return total, offset + returned if more else None
+
+
+class _CategoryGroupRef(BaseModel):
+    type: str | None = None
+
+
+class _CategoryWithGroup(BaseModel):
+    id: str | None = None
+    group: _CategoryGroupRef | None = None
+
+
+def _transfer_category_ids(categories_response: object) -> set[str]:
+    """Return IDs of categories whose group type is "transfer", such as card payments.
+
+    Transactions from get_transactions carry only the category ID and name, so
+    the group type comes from get_transaction_categories.
+    """
+    items = categories_response.get("categories") if isinstance(categories_response, dict) else categories_response
+    categories = TypeAdapter(list[_CategoryWithGroup]).validate_python(items)
+    return {c.id for c in categories if c.id and c.group is not None and c.group.type == "transfer"}
+
+
+def _is_transfer(txn: dict[str, JsonValue], transfer_ids: set[str]) -> bool:
+    # Moving money between accounts is neither income nor spending; counting a
+    # card payment as an expense double-counts the purchases it pays for.
+    category = txn.get("category")
+    if not isinstance(category, dict):
+        return False
+    group = category.get("group")
+    if isinstance(group, dict) and group.get("type") == "transfer":
+        return True
+    category_id = category.get("id")
+    return isinstance(category_id, str) and category_id in transfer_ids
+
+
 class AccountsResult(MMModel):
     accounts: list[JsonValue]
     count: int
@@ -907,6 +930,37 @@ class TransactionResult(MMModel):
     transaction: JsonValue
 
 
+def _require_finite_amount(amount: float) -> None:
+    """Validate direct calls as well as MCP's schema-validated calls."""
+    if not math.isfinite(amount):
+        raise ValueError("amount must be finite")
+
+
+def _checked_mutation_record(result: object, payload_name: str, record_name: str, action: str) -> dict[str, JsonValue]:
+    """Require a successful mutation payload and an identified returned record.
+
+    Some successful core mutations include an errors object with only null fields.
+    Transaction rules retain their separate, stricter response validation.
+    """
+    envelope = TypeAdapter(dict[str, JsonValue]).validate_python(convert_dates_to_strings(result))
+    payload = envelope.get(payload_name)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Monarch returned an invalid {action} response")
+    errors = payload.get("errors")
+    rejected = (
+        any(value not in (None, []) for key, value in errors.items() if key != "__typename")
+        if isinstance(errors, dict)
+        else bool(errors)
+    )
+    if rejected:
+        raise ValueError(f"Monarch rejected the {action}: {scrub_text(str(errors))}")
+    record = payload.get(record_name)
+    record_id = record.get("id") if isinstance(record, dict) else None
+    if not isinstance(record, dict) or not isinstance(record_id, str) or not record_id.strip():
+        raise ValueError(f"Monarch returned no {record_name} for the {action}")
+    return record
+
+
 class TransactionSplit(BaseModel):
     """One leg of a split transaction.
 
@@ -917,7 +971,7 @@ class TransactionSplit(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    amount: float
+    amount: FiniteFloat
     category_id: str | None = None
     merchant_name: str | None = None
     notes: str | None = None
@@ -1033,7 +1087,7 @@ class TransactionUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     transaction_id: StrictStr = Field(min_length=1)
-    amount: float | None = None
+    amount: FiniteFloat | None = None
     merchant_name: StrictStr | None = None
     category_id: StrictStr | None = None
     date: StrictStr | None = None
@@ -1047,6 +1101,14 @@ class TransactionUpdate(BaseModel):
     def _amount_is_a_number(cls, value: object) -> object:
         if value is not None and (isinstance(value, bool) or not isinstance(value, (int, float))):
             raise ValueError("amount must be a number")
+        return value
+
+    @field_validator("amount")
+    @classmethod
+    def _amount_is_nonzero(cls, value: float | None) -> float | None:
+        # The pinned client drops zero rather than sending it to Monarch.
+        if value == 0:
+            raise ValueError("amount cannot be 0: Monarch's client ignores a zero amount")
         return value
 
     @field_validator("date")
@@ -1187,6 +1249,7 @@ class SpendingSummaryResult(MMModel):
     group_by: str
     groups: dict[str, GroupSummary]
     totals: Totals
+    transfers_excluded: int = 0
 
 
 class FinancialOverview(MMModel):
@@ -1208,6 +1271,7 @@ class SpendingPatterns(MMModel):
     budget_performance: JsonValue = None
     forecast: JsonValue = None
     metadata: JsonValue = None
+    errors: dict[str, str] = Field(default_factory=dict)
 
 
 # =============================================================================
@@ -2617,7 +2681,7 @@ async def get_transaction_categories(verbose: bool = False) -> CategoriesResult:
 @mcp.tool(annotations=WRITE_CREATE, title="Create Transaction")
 @track_usage
 async def create_transaction(
-    amount: float,
+    amount: FiniteFloat,
     merchant_name: str,
     account_id: str,
     date: str,
@@ -2646,6 +2710,7 @@ async def create_transaction(
     not created twice.
     """
     require_tool_enabled("create_transaction")
+    _require_finite_amount(amount)
 
     if not merchant_name or merchant_name.strip() == "":
         raise ValueError("merchant_name cannot be empty")
@@ -2669,6 +2734,7 @@ async def create_transaction(
         notes=notes or "",
         update_balance=update_balance,
     )
+    _checked_mutation_record(result, "createTransaction", "transaction", "transaction creation")
     return TransactionResult(transaction=convert_dates_to_strings(result))
 
 
@@ -2676,7 +2742,7 @@ async def create_transaction(
 @track_usage
 async def update_transaction(
     transaction_id: str,
-    amount: float | None = None,
+    amount: FiniteFloat | None = None,
     merchant_name: str | None = None,
     category_id: str | None = None,
     date: str | None = None,
@@ -2761,6 +2827,7 @@ async def update_transaction(
 
     log.info("updating_transaction", fields=sorted(k for k in updates if k != "transaction_id"))
     result = await write_call("update_transaction", creates=False, description="The transaction update", **updates)
+    _checked_mutation_record(result, "updateTransaction", "transaction", "transaction update")
     return TransactionResult(transaction=convert_dates_to_strings(result))
 
 
@@ -2823,13 +2890,14 @@ async def update_transactions_bulk(updates: str) -> BulkUpdateResult:
                     error="Not attempted: authentication failed earlier in this batch",
                 )
             try:
-                await write_call(
+                result = await write_call(
                     "update_transaction",
                     creates=False,
                     description=f"The update to transaction {update.transaction_id}",
                     max_auth_retries=0,
                     **build_transaction_update(update),
                 )
+                _checked_mutation_record(result, "updateTransaction", "transaction", "transaction update")
             except Exception as e:
                 if isinstance(e, SessionUnavailableError) or is_auth_error(e):
                     auth_failed.set()
@@ -2950,13 +3018,8 @@ async def update_transaction_splits(transaction_id: str, splits: list[Transactio
     )
     result = convert_dates_to_strings(result)
 
-    payload = result.get("updateTransactionSplit") or {} if isinstance(result, dict) else {}
-    errors = payload.get("errors")
-    if errors:
-        raise ValueError(f"Monarch rejected the split update: {errors}")
-
-    transaction = payload.get("transaction") or {}
-    result_splits = transaction.get("splitTransactions") or []
+    transaction = _checked_mutation_record(result, "updateTransactionSplit", "transaction", "split update")
+    result_splits = TypeAdapter(list[JsonValue]).validate_python(transaction.get("splitTransactions"))
     message = (
         f"Removed all splits from transaction {transaction_id}"
         if not split_data
@@ -3469,9 +3532,10 @@ async def get_recurring_transactions() -> RecurringResult:
 
 @mcp.tool(annotations=WRITE_REPLACE, title="Set Budget Amount")
 @track_usage
-async def set_budget_amount(category_id: str, amount: float) -> SetBudgetResult:
+async def set_budget_amount(category_id: str, amount: FiniteFloat) -> SetBudgetResult:
     """Set the budget amount for a category, replacing its current amount."""
     require_tool_enabled("set_budget_amount")
+    _require_finite_amount(amount)
     if not category_id:
         raise ValueError("category_id is required")
 
@@ -3480,6 +3544,7 @@ async def set_budget_amount(category_id: str, amount: float) -> SetBudgetResult:
     result = await write_call(
         "set_budget_amount", creates=False, description="The budget change", category_id=category_id, amount=amount
     )
+    _checked_mutation_record(result, "updateOrCreateBudgetItem", "budgetItem", "budget update")
     log.info("Budget amount updated")
     return SetBudgetResult(category_id=category_id, amount=amount, result=convert_dates_to_strings(result))
 
@@ -3490,7 +3555,7 @@ async def create_manual_account(
     account_name: str,
     account_type: str,
     account_sub_type: str,
-    balance: float = 0.0,
+    balance: FiniteFloat = 0.0,
     is_in_net_worth: bool = True,
 ) -> CreateAccountResult:
     """Create a manually tracked account.
@@ -3506,6 +3571,7 @@ async def create_manual_account(
     retrying so the account is not created twice.
     """
     require_tool_enabled("create_manual_account")
+    _require_finite_amount(balance)
     if not account_name or not account_name.strip():
         raise ValueError("account_name cannot be empty")
     if not account_type or not account_sub_type:
@@ -3523,6 +3589,7 @@ async def create_manual_account(
         account_name=account_name,
         account_balance=balance,
     )
+    _checked_mutation_record(result, "createManualAccount", "account", "manual account creation")
     log.info("Manual account created")
     return CreateAccountResult(account=convert_dates_to_strings(result))
 
@@ -3532,41 +3599,52 @@ async def create_manual_account(
 async def get_spending_summary(
     start_date: str | None = None, end_date: str | None = None, group_by: str = "category"
 ) -> SpendingSummaryResult:
-    """Get intelligent spending summary with aggregations.
+    """Summarize income, expenses, and net by category, account, or month.
 
     Args:
-        start_date: Start date (supports natural language like 'last month')
-        end_date: End date (supports natural language)
-        group_by: Group spending by 'category', 'account', or 'month'
+        start_date: Inclusive start; accepts ISO dates or natural language.
+        end_date: Inclusive end; accepts the same formats. A missing end defaults
+            to today; a missing start to the first day of the end date's month.
+        group_by: 'category', 'account', or 'month'; other values produce one group.
+
+    Fetches all matching pages. Expenses are positive magnitudes. Transfers
+    (categories in Monarch's transfer group, such as credit card payments) are
+    left out and counted in transfers_excluded. period holds the resolved ISO dates.
     """
+    filters = build_date_filter(start_date, end_date)
     await ensure_authenticated()
+    transfer_ids = _transfer_category_ids(await api_call_with_retry("get_transaction_categories"))
+    page_size = 1000
+    offset: int | None = 0
+    # Aggregate each page as it arrives so memory stays bounded by one page.
+    totals = {"income": 0.0, "expenses": 0.0}
+    groups: dict[str, dict[str, float]] = {}
+    transfers_excluded = 0
+    transaction_count = 0
+    while offset is not None:
+        response = await api_call_with_retry(
+            "get_transactions",
+            limit=page_size,
+            offset=offset,
+            **filters,  # type: ignore[arg-type]
+        )
+        page = extract_transactions_list(response)
+        if not page:
+            break
+        transaction_count += len(page)
+        _, offset = _transaction_paging(response, offset, page_size, len(page))
 
-    try:
-        log.info("Generating spending summary", group_by=group_by)
-
-        # Get transactions for the period
-        filters = build_date_filter(start_date, end_date)
-        response = await api_call_with_retry("get_transactions", limit=1000, **filters)  # type: ignore[arg-type]
-        # Extract transactions list from nested response structure
-        transactions = extract_transactions_list(response)
-
-        # Aggregate spending data
-        summary: dict[str, Any] = {
-            "groups": {},
-            "totals": {"income": 0, "expenses": 0, "net": 0},
-        }
-
-        for txn in transactions:
+        for txn in page:
+            if _is_transfer(txn, transfer_ids):
+                transfers_excluded += 1
+                continue
             amount = float(txn.get("amount", 0))
 
-            # Track totals
-            totals: dict[str, float] = summary["totals"]
             if amount > 0:
                 totals["income"] += amount
             else:
                 totals["expenses"] += abs(amount)
 
-            # Group by specified field
             if group_by == "category":
                 key = (
                     txn.get("category", {}).get("name", "Uncategorized")
@@ -3575,7 +3653,9 @@ async def get_spending_summary(
                 )
             elif group_by == "account":
                 key = (
-                    txn.get("account", {}).get("name", "Unknown") if isinstance(txn.get("account"), dict) else "Unknown"
+                    (txn["account"].get("displayName") or txn["account"].get("name") or "Unknown")
+                    if isinstance(txn.get("account"), dict)
+                    else "Unknown"
                 )
             elif group_by == "month":
                 txn_date = txn.get("date", "")
@@ -3583,7 +3663,6 @@ async def get_spending_summary(
             else:
                 key = "All"
 
-            groups: dict[str, dict[str, float]] = summary["groups"]
             if key not in groups:
                 groups[key] = {"income": 0, "expenses": 0, "net": 0, "count": 0}
 
@@ -3596,33 +3675,26 @@ async def get_spending_summary(
             group["net"] += amount
             group["count"] += 1
 
-        summary["totals"]["net"] = summary["totals"]["income"] - summary["totals"]["expenses"]
+    sorted_groups = dict(sorted(groups.items(), key=lambda x: x[1]["expenses"], reverse=True))
 
-        # Sort groups by total spending (expenses)
-        sorted_groups = dict(sorted(summary["groups"].items(), key=lambda x: x[1]["expenses"], reverse=True))
+    result = SpendingSummaryResult(
+        period=Period(start=filters.get("start_date"), end=filters.get("end_date")),
+        group_by=group_by,
+        groups={
+            key: GroupSummary(income=g["income"], expenses=g["expenses"], net=g["net"], count=int(g["count"]))
+            for key, g in sorted_groups.items()
+        },
+        totals=Totals(income=totals["income"], expenses=totals["expenses"], net=totals["income"] - totals["expenses"]),
+        transfers_excluded=transfers_excluded,
+    )
 
-        totals_data: dict[str, float] = summary["totals"]
-        result = SpendingSummaryResult(
-            period=Period(start=start_date, end=end_date),
-            group_by=group_by,
-            groups={
-                key: GroupSummary(income=g["income"], expenses=g["expenses"], net=g["net"], count=int(g["count"]))
-                for key, g in sorted_groups.items()
-            },
-            totals=Totals(income=totals_data["income"], expenses=totals_data["expenses"], net=totals_data["net"]),
-        )
+    log.info(
+        "Spending summary generated",
+        total_transactions=transaction_count,
+        groups_count=len(result.groups),
+    )
 
-        log.info(
-            "Spending summary generated",
-            total_transactions=len(transactions),
-            groups_count=len(result.groups),
-        )
-
-        return result
-
-    except Exception as e:
-        log.error("Failed to generate spending summary", **safe_error_fields(e))
-        raise
+    return result
 
 
 @mcp.tool(annotations=WRITE_REFRESH, title="Refresh Accounts")
@@ -3815,15 +3887,17 @@ async def get_complete_financial_overview(period: str = "this month", ctx: Conte
 
     Args:
         period: Time period for analysis ("this month", "last month", "this year", etc.)
+
+    The period supplies the start; the end remains today. The transaction summary
+    covers up to 500 records and excludes transfers when categories are available.
+    Metadata reports truncation; transfers_excluded is null if categories failed.
     """
+    filters = build_date_filter(period, None)
     await ensure_authenticated()
 
     try:
         if ctx is not None:
             await ctx.report_progress(0, 5, "Fetching accounts, budgets, cashflow, transactions, categories…")
-
-        # Parse the period into date filters
-        filters = build_date_filter(period, None)
 
         # Execute all API calls in parallel for maximum efficiency
         accounts_task = api_call_with_retry("get_accounts")
@@ -3837,6 +3911,14 @@ async def get_complete_financial_overview(period: str = "this month", ctx: Conte
             accounts_task, budgets_task, cashflow_task, transactions_task, categories_task, return_exceptions=True
         )
         accounts, budgets, cashflow, transactions, categories = api_results
+
+        transfer_ids: set[str] | None = None
+        if not isinstance(categories, Exception):
+            try:
+                transfer_ids = _transfer_category_ids(categories)
+            except ValueError as error:
+                categories = error
+                log.warning("overview_transfer_categories_unreadable", **safe_error_fields(error))
 
         # Handle any exceptions gracefully
         results: dict[str, Any] = {}
@@ -3860,15 +3942,21 @@ async def get_complete_financial_overview(period: str = "this month", ctx: Conte
             # Extract transactions list from nested response structure
             transactions_list = extract_transactions_list(transactions)
             results["transactions"] = convert_dates_to_strings(transactions_list)
+            spending_transactions = [
+                t for t in transactions_list if transfer_ids is None or not _is_transfer(t, transfer_ids)
+            ]
             # Add intelligent transaction analysis
             if isinstance(transactions_list, list):
                 results["transaction_summary"] = {
                     "total_count": len(transactions_list),
                     "total_income": sum(
-                        float(t.get("amount", 0)) for t in transactions_list if float(t.get("amount", 0)) > 0
+                        float(t.get("amount", 0)) for t in spending_transactions if float(t.get("amount", 0)) > 0
                     ),
                     "total_expenses": sum(
-                        abs(float(t.get("amount", 0))) for t in transactions_list if float(t.get("amount", 0)) < 0
+                        abs(float(t.get("amount", 0))) for t in spending_transactions if float(t.get("amount", 0)) < 0
+                    ),
+                    "transfers_excluded": (
+                        len(transactions_list) - len(spending_transactions) if transfer_ids is not None else None
                     ),
                     "unique_categories": len(
                         {
@@ -3903,6 +3991,11 @@ async def get_complete_financial_overview(period: str = "this month", ctx: Conte
             "filters_applied": convert_dates_to_strings(filters),
             "api_calls_made": 5,
             "timestamp": datetime.now().isoformat(),
+            "transactions_truncated": (
+                _transactions_truncated(transactions, len(transactions_list))
+                if not isinstance(transactions, Exception)
+                else None
+            ),
         }
         results["period"] = period
 
@@ -3939,6 +4032,8 @@ async def analyze_spending_patterns(
         lookback_months: Number of months to analyze (default 6)
         include_forecasting: Whether to include spending forecasts
     """
+    if lookback_months < 1:
+        raise ValueError("lookback_months must be at least 1")
     await ensure_authenticated()
 
     try:
@@ -3951,9 +4046,11 @@ async def analyze_spending_patterns(
 
         # Batch API calls for comprehensive data
         transactions_task = api_call_with_retry(
-            "get_transactions", limit=2000, start_date=start_date, end_date=end_date
+            "get_transactions", limit=2000, start_date=start_date.isoformat(), end_date=end_date.isoformat()
         )
-        budgets_task = api_call_with_retry("get_budgets", start_date=start_date, end_date=end_date)
+        budgets_task = api_call_with_retry(
+            "get_budgets", start_date=start_date.isoformat(), end_date=end_date.isoformat()
+        )
         accounts_task = api_call_with_retry("get_accounts")
         categories_task = api_call_with_retry("get_transaction_categories")
 
@@ -3961,6 +4058,18 @@ async def analyze_spending_patterns(
             transactions_task, budgets_task, accounts_task, categories_task, return_exceptions=True
         )
         transactions, budgets, accounts, categories = api_results
+        errors = {
+            name: scrub_text(str(result))
+            for name, result in zip(("transactions", "budgets", "accounts", "categories"), api_results, strict=True)
+            if isinstance(result, Exception)
+        }
+        transfer_ids: set[str] | None = None
+        if not isinstance(categories, Exception):
+            try:
+                transfer_ids = _transfer_category_ids(categories)
+            except ValueError as error:
+                errors["categories"] = scrub_text(str(error))
+        transfers_excluded = 0
 
         if ctx is not None:
             await ctx.report_progress(1, 2, "Computing trends, category and account analysis…")
@@ -3987,6 +4096,9 @@ async def analyze_spending_patterns(
             account_usage: dict[str, dict[str, float]] = {}
 
             for txn in transactions_list:
+                if transfer_ids is not None and _is_transfer(txn, transfer_ids):
+                    transfers_excluded += 1
+                    continue
                 txn_date = txn.get("date", "")
                 amount = float(txn.get("amount", 0))
                 category_name = (
@@ -4011,10 +4123,11 @@ async def analyze_spending_patterns(
                 monthly_data[month_key]["transaction_count"] += 1
 
                 # Category analysis
-                if category_name not in category_totals:
-                    category_totals[category_name] = {"total": 0.0, "transactions": 0.0, "avg_amount": 0.0}
-                category_totals[category_name]["total"] += abs(amount) if amount < 0 else 0.0  # Only expenses
-                category_totals[category_name]["transactions"] += 1
+                if amount < 0:
+                    if category_name not in category_totals:
+                        category_totals[category_name] = {"total": 0.0, "transactions": 0.0, "avg_amount": 0.0}
+                    category_totals[category_name]["total"] += abs(amount)
+                    category_totals[category_name]["transactions"] += 1
 
                 # Account usage
                 if account_name not in account_usage:
@@ -4037,9 +4150,25 @@ async def analyze_spending_patterns(
                 sorted(account_usage.items(), key=lambda x: x[1]["total_volume"], reverse=True)  # type: ignore[index]
             )
 
-            # Simple forecasting if requested
-            if include_forecasting and monthly_data:
-                recent_months = list(monthly_data.values())[-3:]  # Last 3 months
+            # Monarch returns newest first. Exclude partial calendar months and
+            # the oldest returned month when the transaction sample was truncated.
+            current_month = end_date.strftime("%Y-%m")
+            first_month = start_date.strftime("%Y-%m")
+            complete_months = sorted(
+                key
+                for key in monthly_data
+                if key != "Unknown"
+                and first_month <= key < current_month
+                and (key > first_month or start_date.day == 1)
+            )
+            if _transactions_truncated(transactions, len(transactions_list)) and complete_months:
+                oldest_returned_month = min(
+                    (t["date"][:7] for t in transactions_list if isinstance(t.get("date"), str)), default="Unknown"
+                )
+                complete_months = [key for key in complete_months if key > oldest_returned_month]
+            if include_forecasting and complete_months:
+                forecast_months = complete_months[-3:]
+                recent_months = [monthly_data[key] for key in forecast_months]
                 if recent_months:
                     avg_monthly_expenses = sum(m["expenses"] for m in recent_months) / len(recent_months)
                     avg_monthly_income = sum(m["income"] for m in recent_months) / len(recent_months)
@@ -4051,7 +4180,7 @@ async def analyze_spending_patterns(
                         "predicted_income": round(avg_monthly_income, 2),
                         "predicted_net": round(avg_monthly_income - avg_monthly_expenses, 2),
                         "confidence": "medium",  # Based on 3-month average
-                        "note": "Forecast based on 3-month spending average",
+                        "note": f"Forecast averages complete months {', '.join(forecast_months)}",
                     }
 
         if not isinstance(budgets, Exception):
@@ -4063,6 +4192,10 @@ async def analyze_spending_patterns(
             "api_calls_made": 4,
             "total_transactions_analyzed": txn_count,
             "analysis_timestamp": datetime.now().isoformat(),
+            "transfers_excluded": transfers_excluded if transfer_ids is not None else None,
+            "transactions_truncated": (
+                _transactions_truncated(transactions, txn_count) if not isinstance(transactions, Exception) else None
+            ),
         }
 
         if ctx is not None:
@@ -4075,7 +4208,7 @@ async def analyze_spending_patterns(
             include_forecasting=include_forecasting,
         )
 
-        return SpendingPatterns.model_validate(analysis)
+        return SpendingPatterns.model_validate({**analysis, "errors": errors})
 
     except Exception as e:
         log.error("Failed to analyze spending patterns", **safe_error_fields(e))

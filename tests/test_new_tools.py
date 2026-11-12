@@ -114,7 +114,7 @@ class TestNewMonarchTools:
     async def test_set_budget_amount(self) -> None:
         """Test set_budget_amount functionality."""
         mock_client = AsyncMock()
-        mock_result = {"category_id": "cat123", "amount": 500, "status": "updated"}
+        mock_result = {"updateOrCreateBudgetItem": {"budgetItem": {"id": "budget_123", "budgetAmount": 500}}}
         mock_client.set_budget_amount.return_value = mock_result
 
         original_client = server.mm_client
@@ -141,7 +141,7 @@ class TestNewMonarchTools:
     async def test_create_manual_account(self) -> None:
         """Test create_manual_account functionality."""
         mock_client = AsyncMock()
-        mock_result = {"id": "acc456", "name": "My Savings", "type": "savings"}
+        mock_result = {"createManualAccount": {"account": {"id": "acc456"}, "errors": None}}
         mock_client.create_manual_account.return_value = mock_result
 
         original_client = server.mm_client
