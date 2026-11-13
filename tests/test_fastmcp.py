@@ -157,7 +157,7 @@ class TestFastMCPServer:
         """Test create_transaction functionality."""
         # Setup mock client
         mock_client = AsyncMock()
-        mock_result = {"id": "new123", "status": "created"}
+        mock_result = {"createTransaction": {"transaction": {"id": "new123"}, "errors": None}}
         mock_client.create_transaction.return_value = mock_result
 
         # Set global client

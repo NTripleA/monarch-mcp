@@ -53,10 +53,12 @@ class TestToolLoggingCarriesNoFinancialData:
             category_id=CATEGORY_ID,
             notes=NOTES,
         )
+        mock_api.return_value = {"updateTransaction": {"transaction": {"id": TXN_ID, "amount": AMOUNT}}}
         await server.update_transaction(transaction_id=TXN_ID, notes=NOTES, amount=AMOUNT, category_id=CATEGORY_ID)
         await server.update_transactions_bulk(
             json.dumps([{"transaction_id": TXN_ID, "merchant_name": MERCHANT, "amount": AMOUNT}])
         )
+        mock_api.return_value = {"updateOrCreateBudgetItem": {"budgetItem": {"id": "budget_1", "budgetAmount": AMOUNT}}}
         await server.set_budget_amount(category_id=CATEGORY_ID, amount=AMOUNT)
         assert_absent(all_log_text(logs), SENSITIVE_STRINGS)
 

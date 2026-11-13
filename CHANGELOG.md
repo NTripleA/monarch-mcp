@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Correctness backports
+
+- Spending summaries fetch and aggregate every transaction page, fixing the silent 1,000-row cutoff without retaining the whole history in memory. Summaries, financial overviews, and spending patterns exclude transfers from income and expenses and report `transfers_excluded`.
+- Month/year inputs such as `2024-02`, `January 2024`, and `last year` now span the full period when used as both date bounds. A missing end date still defaults to today. Summary responses report the resolved ISO dates.
+- Forecasts select up to three recent complete months chronologically, excluding the current month, a partial first month, and a truncated page's oldest month. Category expense averages count only expense transactions. Analysis requests send ISO date strings, reject nonpositive lookbacks, and expose partial API failures and transaction-sample truncation.
+- Transaction creation, single/bulk updates, split replacement, budget updates, and manual-account creation now validate Monarch's mutation response before reporting success. Confirmed errors raise a scrubbed rejection; missing or malformed confirmations raise `WriteOutcomeUnknownError` with create/update-specific advice to check before retrying. Existing response shapes remain intact, including per-item bulk failures.
+- Zero-budget unsets accept an explicit `budgetItem: null` without errors; a missing payload or record remains outcome-unknown. Split removal accepts `splitTransactions: null` as an empty list. The zero-budget response is covered offline but has not been verified live.
+- All three spending analysis tools use the same account-name fallback: `displayName`, then `name`, then `Unknown`.
+- Amounts reject NaN and infinity. Transaction updates also reject zero, which the pinned client silently omits; a bad bulk item still rejects the entire batch before any write. Zero remains valid for creation, balances, budgets, and split legs.
+- Adapted from upstream `b9de388`, `c5c632b`, `c8bb3de`, `e7e006a`, `f0a25a0`, and the response validation in `d312f3f`. Retains MCP SDK 1, the existing client pin, all 26 tools, HTTP/session-only access, browser authentication, private logging, the write gate, and strict rule validation.
+- Added 129 offline regression cases and corrected older mock responses to match the pinned client's GraphQL envelopes. Local checks: 631 passed, 11 live-account tests skipped, 4 existing warnings on Python 3.13.5; lint, formatting, and type checks pass.
+
 ### Transaction rules
 
 - new `get_transaction_rules`, `preview_transaction_rule`, and `create_transaction_rule` tools (26 tools total). Rules can match on merchant name, original statement text, or amount (optionally narrowed to accounts or current categories) and set a category, rename the merchant, or hide from reports. Update, delete, and reordering are not supported yet.

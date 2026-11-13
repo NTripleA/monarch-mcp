@@ -77,7 +77,7 @@ class TestFastMCPParameterValidation:
         """Test create_transaction with all required parameters."""
         # Setup mock client
         mock_client = AsyncMock()
-        mock_result = {"id": "new123", "status": "created"}
+        mock_result = {"createTransaction": {"transaction": {"id": "new123"}, "errors": None}}
         mock_client.create_transaction.return_value = mock_result
 
         original_client = server.mm_client
@@ -111,7 +111,7 @@ class TestFastMCPParameterValidation:
         """Test create_transaction with optional parameters."""
         # Setup mock client
         mock_client = AsyncMock()
-        mock_result = {"id": "new123", "status": "created"}
+        mock_result = {"createTransaction": {"transaction": {"id": "new123"}, "errors": None}}
         mock_client.create_transaction.return_value = mock_result
 
         original_client = server.mm_client
@@ -144,7 +144,7 @@ class TestFastMCPParameterValidation:
         """Test update_transaction with only some fields updated."""
         # Setup mock client
         mock_client = AsyncMock()
-        mock_result = {"id": "txn123", "status": "updated"}
+        mock_result = {"updateTransaction": {"transaction": {"id": "txn123"}, "errors": None}}
         mock_client.update_transaction.return_value = mock_result
 
         original_client = server.mm_client

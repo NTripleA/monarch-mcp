@@ -1,9 +1,11 @@
 """Tests for usage analytics and batch tools."""
 
 import json
+from datetime import date
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from dateutil.relativedelta import relativedelta
 
 import server
 
@@ -97,10 +99,12 @@ class TestBatchTools:
         """Test spending pattern analysis with forecasting."""
         # Setup mock client
         mock_client = AsyncMock()
+        previous_month = (date.today().replace(day=1) - relativedelta(months=1)).isoformat()
+        earlier_month = (date.today().replace(day=1) - relativedelta(months=2)).isoformat()
         mock_transactions = [
-            {"date": "2024-01-15", "amount": -100, "category": {"name": "Food"}, "account": {"name": "Checking"}},
-            {"date": "2024-01-20", "amount": -50, "category": {"name": "Gas"}, "account": {"name": "Checking"}},
-            {"date": "2024-02-10", "amount": 3000, "category": {"name": "Salary"}, "account": {"name": "Checking"}},
+            {"date": earlier_month, "amount": -100, "category": {"name": "Food"}, "account": {"name": "Checking"}},
+            {"date": earlier_month, "amount": -50, "category": {"name": "Gas"}, "account": {"name": "Checking"}},
+            {"date": previous_month, "amount": 3000, "category": {"name": "Salary"}, "account": {"name": "Checking"}},
         ]
         mock_client.get_transactions.return_value = mock_transactions
         mock_client.get_budgets.return_value = []
@@ -127,10 +131,10 @@ class TestBatchTools:
 
                 # Verify monthly trends
                 monthly_trends = analysis["monthly_trends"]
-                assert "2024-01" in monthly_trends
-                assert "2024-02" in monthly_trends
-                assert monthly_trends["2024-01"]["expenses"] == 150  # 100 + 50
-                assert monthly_trends["2024-02"]["income"] == 3000
+                assert earlier_month[:7] in monthly_trends
+                assert previous_month[:7] in monthly_trends
+                assert monthly_trends[earlier_month[:7]]["expenses"] == 150  # 100 + 50
+                assert monthly_trends[previous_month[:7]]["income"] == 3000
 
                 # Verify category analysis
                 category_analysis = analysis["category_analysis"]

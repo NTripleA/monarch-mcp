@@ -320,14 +320,20 @@ window before an MFA retry rather than replaying a code Monarch has already cons
 - **✅ Structured Logging**: Context-rich logs with `structlog`
 - **✅ Complete API Coverage**: All 14 Monarch Money API methods as tools
 
-#### Quality Metrics (Updated May 2026)
-- **206 passing tests** with comprehensive coverage including analytics, search, bulk operations, splits, structured output, completions, resource templates, and progress
-- **21 tools** (all returning typed Pydantic models / structured output), 3 static resources + 2 resource templates, 4 prompts
+#### Quality Metrics (Correctness backport, November 2026)
+- **631 passing offline tests**, 11 live-account tests skipped (4 existing warnings) on Python 3.13.5, including 129 new correctness regression cases and the existing privacy, HTTP, session, write-gate, and rule suites
+- **26 tools** (all returning typed Pydantic models / structured output), 3 static resources + 2 resource templates, 4 prompts
 - **MyPy clean** under the repo's strict config (no `Any` at non-boundaries, no `as`)
 - **Security**: Proper session handling and MFA support
-- **Modern stack**: FastMCP 1.12.2, Pydantic, structlog, pytest
+- **Stack**: MCP SDK 1.28.1 / FastMCP, Pydantic, structlog, pytest; dependency pins are unchanged by the correctness backport
 - **Usage analytics**: Real-time performance tracking and optimization suggestions
-- **Codebase**: 1,447 lines in server.py, 7 test files with comprehensive coverage
+
+#### Correctness backports
+- Spending summaries aggregate all pages and exclude transfers. Overview and spending-pattern samples also exclude transfers and report truncation; category failures remain visible.
+- Month/year inputs cover full calendar periods when used as both bounds. Missing end dates still mean today. Forecasts use recent complete months and category averages count expenses only.
+- Core mutation responses distinguish confirmed rejections (plain `ValueError`, with scrubbed Monarch error text) from missing/malformed confirmations (`WriteOutcomeUnknownError`, with create/update-specific retry warnings, including bulk items). Zero-budget unsets accept an explicit null `budgetItem` without errors; missing payloads or records remain outcome-unknown. Null split lists become empty lists. The zero-budget response is tested offline but unverified live.
+- All three spending analysis tools resolve account names using `displayName`, then `name`, then `Unknown`. Finite amounts are enforced and zero transaction updates are rejected. Keep the current response shapes, `write_call`, whole-batch validation, write gate, session-only auth, and private logging.
+- Rule response checks remain separate and strict; do not replace them with upstream's permissive empty-list fallback. Browser authentication and HTTP deployment remain on the current SDK.
 
 ### ✅ ADVANCED FEATURES (Recently Completed)
 
@@ -466,7 +472,7 @@ window before an MFA retry rather than replaying a code Monarch has already cons
 5. **Phase 5 (Intelligence)**: ML features, advanced analytics, financial insights
 6. **Phase 6 (Ecosystem)**: MCP extensions, developer tools, architectural improvements
 
-**Current Status** (Updated June 2026): Production-ready with 206 passing tests, 21 intelligent tools (including transaction splitting via `get_transaction_splits` / `update_transaction_splits`), comprehensive analytics, robust error handling, and enhanced reliability. Recent MCP modernization: every tool returns structured output (outputSchema + structured content with a text fallback), tools/resources/prompts carry human-friendly `title`s, parameterized resource templates (`accounts://{account_id}/holdings|history`), argument completions for prompts/templates, and Context-based progress reporting on the batch tools. Earlier features: `update_transactions_bulk()` for parallel batch updates, `search_transactions`, result-size tracking; fixes for the auth retry bug, date serialization, broken pipes, and date parsing. Note: `get_account_holdings` now requires an `account_id` (the underlying library always did).
+**Current Status** (November 2026 correctness backport): 631 offline tests pass and 11 live-account tests are skipped (4 existing warnings) on Python 3.13.5. The 26-tool fork retains its HTTP/session-only deployment, browser sign-in, private logging, write controls, and strict transaction-rule checks. Selected upstream fixes cover spending pagination, transfers, calendar dates, forecasting, mutation responses, and finite amounts; MCP SDK 2 migration and new upstream tools remain separate work.
 
 ## Upstream Library & Fork Landscape
 

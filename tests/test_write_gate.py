@@ -224,6 +224,7 @@ class TestBulkSafety:
     @pytest.mark.asyncio
     async def test_batch_at_the_limit_is_accepted(self, mock_api: AsyncMock) -> None:
         server.RUNTIME.max_bulk_updates = 3
+        mock_api.return_value = {"updateTransaction": {"transaction": {"id": "txn_example"}, "errors": None}}
         batch = [{"transaction_id": f"txn_{i}", "notes": "n"} for i in range(3)]
         result = await server.update_transactions_bulk(json.dumps(batch))
         assert result.summary.succeeded == 3
@@ -299,7 +300,7 @@ class TestWriteRetrySafety:
 
     @pytest.mark.asyncio
     async def test_writes_allow_at_most_one_auth_retry(self, mock_api: AsyncMock) -> None:
-        mock_api.return_value = {"createTransaction": {}}
+        mock_api.return_value = {"createTransaction": {"transaction": {"id": "txn_1"}, "errors": None}}
         await server.create_transaction(**WRITE_ARGS["create_transaction"])
         assert mock_api.await_args.kwargs["max_retries"] == 1
 
