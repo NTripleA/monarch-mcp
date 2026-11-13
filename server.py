@@ -889,6 +889,16 @@ def _is_transfer(txn: dict[str, JsonValue], transfer_ids: set[str]) -> bool:
     return isinstance(category_id, str) and category_id in transfer_ids
 
 
+def _transaction_account_name(txn: dict[str, JsonValue]) -> str:
+    account = txn.get("account")
+    if isinstance(account, dict):
+        for key in ("displayName", "name"):
+            name = account.get(key)
+            if isinstance(name, str) and name:
+                return name
+    return "Unknown"
+
+
 class AccountsResult(MMModel):
     accounts: list[JsonValue]
     count: int
@@ -936,16 +946,34 @@ def _require_finite_amount(amount: float) -> None:
         raise ValueError("amount must be finite")
 
 
-def _checked_mutation_record(result: object, payload_name: str, record_name: str, action: str) -> dict[str, JsonValue]:
+def _checked_mutation_record(
+    result: object,
+    payload_name: str,
+    record_name: str,
+    action: str,
+    *,
+    creates: bool,
+    description: str,
+    allow_null_record: bool = False,
+) -> dict[str, JsonValue]:
     """Require a successful mutation payload and an identified returned record.
 
     Some successful core mutations include an errors object with only null fields.
     Transaction rules retain their separate, stricter response validation.
+    Unconfirmed responses may follow a committed write. An explicit null record is
+    accepted only for a zero-budget unset, returning an empty internal record.
     """
-    envelope = TypeAdapter(dict[str, JsonValue]).validate_python(convert_dates_to_strings(result))
-    payload = envelope.get(payload_name)
+    uncertain_message = (
+        f"{description} may already have been created: Monarch returned an unconfirmed response. "
+        "Do NOT retry blindly -- first query (e.g. search_transactions / get_transactions / get_accounts) "
+        "to check whether it exists, and only retry if it does not."
+        if creates
+        else f"{description} may or may not have been applied: Monarch returned an unconfirmed response. "
+        "Re-read the record to check its current state before sending the update again."
+    )
+    payload = result.get(payload_name) if isinstance(result, dict) else None
     if not isinstance(payload, dict):
-        raise ValueError(f"Monarch returned an invalid {action} response")
+        raise WriteOutcomeUnknownError(uncertain_message)
     errors = payload.get("errors")
     rejected = (
         any(value not in (None, []) for key, value in errors.items() if key != "__typename")
@@ -954,10 +982,15 @@ def _checked_mutation_record(result: object, payload_name: str, record_name: str
     )
     if rejected:
         raise ValueError(f"Monarch rejected the {action}: {scrub_text(str(errors))}")
-    record = payload.get(record_name)
-    record_id = record.get("id") if isinstance(record, dict) else None
-    if not isinstance(record, dict) or not isinstance(record_id, str) or not record_id.strip():
-        raise ValueError(f"Monarch returned no {record_name} for the {action}")
+    if allow_null_record and record_name in payload and payload[record_name] is None:
+        return {}
+    try:
+        record = TypeAdapter(dict[str, JsonValue]).validate_python(convert_dates_to_strings(payload.get(record_name)))
+    except ValidationError as error:
+        raise WriteOutcomeUnknownError(uncertain_message) from error
+    record_id = record.get("id")
+    if not isinstance(record_id, str) or not record_id.strip():
+        raise WriteOutcomeUnknownError(uncertain_message)
     return record
 
 
@@ -2734,7 +2767,9 @@ async def create_transaction(
         notes=notes or "",
         update_balance=update_balance,
     )
-    _checked_mutation_record(result, "createTransaction", "transaction", "transaction creation")
+    _checked_mutation_record(
+        result, "createTransaction", "transaction", "transaction creation", creates=True, description="The transaction"
+    )
     return TransactionResult(transaction=convert_dates_to_strings(result))
 
 
@@ -2827,7 +2862,14 @@ async def update_transaction(
 
     log.info("updating_transaction", fields=sorted(k for k in updates if k != "transaction_id"))
     result = await write_call("update_transaction", creates=False, description="The transaction update", **updates)
-    _checked_mutation_record(result, "updateTransaction", "transaction", "transaction update")
+    _checked_mutation_record(
+        result,
+        "updateTransaction",
+        "transaction",
+        "transaction update",
+        creates=False,
+        description="The transaction update",
+    )
     return TransactionResult(transaction=convert_dates_to_strings(result))
 
 
@@ -2897,7 +2939,14 @@ async def update_transactions_bulk(updates: str) -> BulkUpdateResult:
                     max_auth_retries=0,
                     **build_transaction_update(update),
                 )
-                _checked_mutation_record(result, "updateTransaction", "transaction", "transaction update")
+                _checked_mutation_record(
+                    result,
+                    "updateTransaction",
+                    "transaction",
+                    "transaction update",
+                    creates=False,
+                    description=f"The update to transaction {update.transaction_id}",
+                )
             except Exception as e:
                 if isinstance(e, SessionUnavailableError) or is_auth_error(e):
                     auth_failed.set()
@@ -3018,8 +3067,10 @@ async def update_transaction_splits(transaction_id: str, splits: list[Transactio
     )
     result = convert_dates_to_strings(result)
 
-    transaction = _checked_mutation_record(result, "updateTransactionSplit", "transaction", "split update")
-    result_splits = TypeAdapter(list[JsonValue]).validate_python(transaction.get("splitTransactions"))
+    transaction = _checked_mutation_record(
+        result, "updateTransactionSplit", "transaction", "split update", creates=False, description="The split update"
+    )
+    result_splits = TypeAdapter(list[JsonValue]).validate_python(transaction.get("splitTransactions") or [])
     message = (
         f"Removed all splits from transaction {transaction_id}"
         if not split_data
@@ -3544,7 +3595,15 @@ async def set_budget_amount(category_id: str, amount: FiniteFloat) -> SetBudgetR
     result = await write_call(
         "set_budget_amount", creates=False, description="The budget change", category_id=category_id, amount=amount
     )
-    _checked_mutation_record(result, "updateOrCreateBudgetItem", "budgetItem", "budget update")
+    _checked_mutation_record(
+        result,
+        "updateOrCreateBudgetItem",
+        "budgetItem",
+        "budget update",
+        creates=False,
+        description="The budget change",
+        allow_null_record=amount == 0,
+    )
     log.info("Budget amount updated")
     return SetBudgetResult(category_id=category_id, amount=amount, result=convert_dates_to_strings(result))
 
@@ -3589,7 +3648,9 @@ async def create_manual_account(
         account_name=account_name,
         account_balance=balance,
     )
-    _checked_mutation_record(result, "createManualAccount", "account", "manual account creation")
+    _checked_mutation_record(
+        result, "createManualAccount", "account", "manual account creation", creates=True, description="The account"
+    )
     log.info("Manual account created")
     return CreateAccountResult(account=convert_dates_to_strings(result))
 
@@ -3652,11 +3713,7 @@ async def get_spending_summary(
                     else "Uncategorized"
                 )
             elif group_by == "account":
-                key = (
-                    (txn["account"].get("displayName") or txn["account"].get("name") or "Unknown")
-                    if isinstance(txn.get("account"), dict)
-                    else "Unknown"
-                )
+                key = _transaction_account_name(txn)
             elif group_by == "month":
                 txn_date = txn.get("date", "")
                 key = txn_date[:7] if len(txn_date) >= 7 else "Unknown"  # YYYY-MM format
@@ -3966,11 +4023,7 @@ async def get_complete_financial_overview(period: str = "this month", ctx: Conte
                         }
                     ),
                     "unique_accounts": len(
-                        {
-                            t.get("account", {}).get("name", "Unknown")
-                            for t in transactions_list
-                            if isinstance(t.get("account"), dict)
-                        }
+                        {_transaction_account_name(t) for t in transactions_list if isinstance(t.get("account"), dict)}
                     ),
                 }
         else:
@@ -4106,9 +4159,7 @@ async def analyze_spending_patterns(
                     if isinstance(txn.get("category"), dict)
                     else "Uncategorized"
                 )
-                account_name = (
-                    txn.get("account", {}).get("name", "Unknown") if isinstance(txn.get("account"), dict) else "Unknown"
-                )
+                account_name = _transaction_account_name(txn)
 
                 # Monthly trends (YYYY-MM)
                 month_key = txn_date[:7] if len(txn_date) >= 7 else "Unknown"

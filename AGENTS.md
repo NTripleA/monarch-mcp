@@ -279,7 +279,7 @@ Update this file when:
 ## Status, Metrics & Implementation Roadmap
 
 ### Production Quality Metrics
-- **Tests:** 583 passing offline tests; 11 live-account tests skipped. Verified locally on Python 3.13.5 for the correctness backport.
+- **Tests:** 631 passing offline tests, including 129 correctness regression cases; 11 live-account tests skipped, 4 existing warnings. Verified locally on Python 3.13.5 for the correctness backport.
 - **Tools:** 26 typed tools returning Pydantic models (structured output).
 - **Resources:** 3 static resources + 2 parameterized templates (`accounts://{account_id}/holdings|history`).
 - **Prompts:** 4 prompt templates with argument completions.
@@ -292,6 +292,7 @@ Update this file when:
 - **Phase 3 (Production Stability):** JSON-RPC stdio protocol compliance, stdout suppression, third-party log silencing, session recovery, comprehensive testing.
 - **Phase 4a (Critical Resilience):** Date serialization fixes (ISO strings), broken pipe handlers, dependency updates, browser auth loopback (`authenticate_browser_session`).
 - **Correctness backports:** All-page spending summaries, transfer exclusions, calendar-period date bounds, recent-complete-month forecasts, mutation-response checks, and finite amounts. Preserve `write_call`, whole-batch validation, the HTTP write gate, session-only authentication, privacy filters, and the separate strict rule validators when extending these paths. The overview and spending-pattern tools still use bounded transaction samples and report truncation in metadata.
+- **Mutation confirmations and account names:** Confirmed Monarch errors raise a scrubbed plain `ValueError`; missing/malformed confirmations raise `WriteOutcomeUnknownError` with create/update-specific retry warnings, also retained in bulk failures. Zero-budget unsets accept an explicit null `budgetItem` without errors, while missing payloads or records remain outcome-unknown; this response is tested offline but unverified live. Null split lists become empty lists. All three spending analysis tools share the `displayName`, `name`, `Unknown` account-name fallback.
 
 ### Remaining Priorities
 

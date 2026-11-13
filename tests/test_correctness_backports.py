@@ -215,7 +215,7 @@ WRITE_CASES: list[tuple[str, dict[str, JsonValue], str, str]] = [
         "updateTransactionSplit",
         "transaction",
     ),
-    ("set_budget_amount", {"category_id": "cat_expense", "amount": 0}, "updateOrCreateBudgetItem", "budgetItem"),
+    ("set_budget_amount", {"category_id": "cat_expense", "amount": 25}, "updateOrCreateBudgetItem", "budgetItem"),
     (
         "create_manual_account",
         {"account_name": "Example Account", "account_type": "depository", "account_sub_type": "checking", "balance": 0},
@@ -228,20 +228,85 @@ WRITE_CASES: list[tuple[str, dict[str, JsonValue], str, str]] = [
 class TestMutationResponses:
     @pytest.mark.parametrize(("tool", "arguments", "key", "record"), WRITE_CASES)
     @pytest.mark.parametrize(
-        "failure", ["missing_payload", "missing_record", "null_record", "empty_record", "rejected"]
+        "failure",
+        [
+            "non_dict",
+            "missing_payload",
+            "null_payload",
+            "missing_record",
+            "null_record",
+            "empty_record",
+            "idless_record",
+            "blank_id",
+        ],
     )
-    async def test_rejected_or_malformed_writes_fail(
+    async def test_unconfirmed_writes_report_unknown_outcome(
         self, mock_api: AsyncMock, tool: str, arguments: dict[str, JsonValue], key: str, record: str, failure: str
     ) -> None:
         payloads: dict[str, object] = {
+            "non_dict": [],
             "missing_payload": {},
+            "null_payload": {key: None},
             "missing_record": {key: {}},
             "null_record": {key: {record: None}},
             "empty_record": {key: {record: {}}},
-            "rejected": {key: {record: {"id": "record_example"}, "errors": [{"message": "Synthetic rejection"}]}},
+            "idless_record": {key: {record: {"amount": 25}}},
+            "blank_id": {key: {record: {"id": " "}}},
         }
         mock_api.return_value = payloads[failure]
-        with pytest.raises(ToolError):
+        with pytest.raises(server.WriteOutcomeUnknownError) as info:
+            await getattr(server, tool)(**arguments)
+        message = str(info.value)
+        if tool in ("create_transaction", "create_manual_account"):
+            description = "The transaction" if tool == "create_transaction" else "The account"
+            assert message.startswith(f"{description} may already have been created")
+            assert "Do NOT retry blindly" in message
+        else:
+            description = {
+                "update_transaction": "The transaction update",
+                "update_transaction_splits": "The split update",
+                "set_budget_amount": "The budget change",
+            }[tool]
+            assert message.startswith(f"{description} may or may not have been applied")
+            assert "Re-read the record" in message
+        assert "Monarch rejected" not in message
+        assert mock_api.await_count == 1
+
+    @pytest.mark.parametrize(("tool", "arguments", "key", "record"), WRITE_CASES)
+    @pytest.mark.parametrize("returned_record", [None, {"id": "record_example"}])
+    @pytest.mark.parametrize("errors", [[{"message": "Synthetic rejection"}], {"message": "Synthetic rejection"}])
+    async def test_confirmed_rejections_are_plain_failures(
+        self,
+        mock_api: AsyncMock,
+        tool: str,
+        arguments: dict[str, JsonValue],
+        key: str,
+        record: str,
+        returned_record: JsonValue,
+        errors: JsonValue,
+    ) -> None:
+        mock_api.return_value = {key: {record: returned_record, "errors": errors}}
+        with pytest.raises(ValueError, match="Monarch rejected") as info:
+            await getattr(server, tool)(**arguments)
+        assert type(info.value) is ValueError
+        assert "may already have been created" not in str(info.value)
+        assert "may or may not have been applied" not in str(info.value)
+        assert mock_api.await_count == 1
+
+    @pytest.mark.parametrize(("tool", "arguments", "key", "record"), WRITE_CASES)
+    async def test_unknown_outcome_warning_reaches_mcp_client(
+        self,
+        mock_api: AsyncMock,
+        tool: str,
+        arguments: dict[str, JsonValue],
+        key: str,
+        record: str,
+    ) -> None:
+        mock_api.return_value = {key: {record: None}}
+        wording = (
+            "Do NOT retry blindly" if tool in ("create_transaction", "create_manual_account") else "Re-read the record"
+        )
+        with pytest.raises(ToolError, match=wording):
             await server.mcp.call_tool(tool, arguments)
         assert mock_api.await_count == 1
 
@@ -273,6 +338,96 @@ class TestMutationResponses:
             )
         )
         assert (result.summary.succeeded, result.summary.failed) == (1, 1)
+
+    async def test_bulk_unconfirmed_item_retains_uncertain_wording(self, mock_api: AsyncMock) -> None:
+        mock_api.side_effect = [
+            {"updateTransaction": {"transaction": None, "errors": None}},
+            {"updateTransaction": {"transaction": {"id": "txn_second"}, "errors": None}},
+        ]
+        result = await server.update_transactions_bulk(
+            json.dumps(
+                [
+                    {"transaction_id": "txn_first", "notes": "Example"},
+                    {"transaction_id": "txn_second", "notes": "Example"},
+                ]
+            )
+        )
+        assert (result.summary.succeeded, result.summary.failed, result.summary.skipped) == (1, 1, 0)
+        first = result.results[0]
+        assert first.status == "error"
+        assert first.error is not None
+        assert first.error.startswith("The update to transaction txn_first may or may not have been applied")
+        assert "Re-read the record" in first.error
+        assert mock_api.await_count == 2
+
+    async def test_zero_budget_accepts_explicit_null_record(self, mock_api: AsyncMock) -> None:
+        response = {"updateOrCreateBudgetItem": {"budgetItem": None}}
+        mock_api.return_value = response
+        result = await server.set_budget_amount(category_id="cat_expense", amount=0)
+        assert result.category_id == "cat_expense"
+        assert result.amount == 0
+        assert result.result == response
+        mock_api.assert_awaited_once_with("set_budget_amount", max_retries=1, category_id="cat_expense", amount=0)
+
+    @pytest.mark.parametrize("response", [None, {}, {"updateOrCreateBudgetItem": {}}])
+    async def test_zero_budget_still_requires_confirmation(self, mock_api: AsyncMock, response: object) -> None:
+        mock_api.return_value = response
+        with pytest.raises(server.WriteOutcomeUnknownError, match="may or may not have been applied"):
+            await server.set_budget_amount(category_id="cat_expense", amount=0)
+
+    async def test_zero_budget_errors_are_rejected_and_scrubbed(self, mock_api: AsyncMock) -> None:
+        mock_api.return_value = {
+            "updateOrCreateBudgetItem": {
+                "budgetItem": None,
+                "errors": {"message": "Synthetic rejection session_id=fakeSECRET"},
+            }
+        }
+        with pytest.raises(ValueError, match="Monarch rejected") as info:
+            await server.set_budget_amount(category_id="cat_expense", amount=0)
+        assert type(info.value) is ValueError
+        assert "fakeSECRET" not in str(info.value)
+        assert "may or may not have been applied" not in str(info.value)
+
+    async def test_split_removal_accepts_null_split_list(self, mock_api: AsyncMock) -> None:
+        mock_api.return_value = {
+            "updateTransactionSplit": {
+                "errors": None,
+                "transaction": {"id": "txn_example", "hasSplitTransactions": False, "splitTransactions": None},
+            }
+        }
+        result = await server.update_transaction_splits(transaction_id="txn_example", splits=[])
+        assert result.transaction_id == "txn_example"
+        assert result.has_split_transactions is False
+        assert result.splits == []
+        assert result.message == "Removed all splits from transaction txn_example"
+        mock_api.assert_awaited_once_with(
+            "update_transaction_splits", max_retries=1, transaction_id="txn_example", split_data=[]
+        )
+
+
+class TestAccountNames:
+    async def test_all_analyses_use_display_names_and_fallbacks(self, mock_api: AsyncMock) -> None:
+        accounts: list[dict[str, JsonValue]] = [
+            {"id": "acct_first", "displayName": "Example checking", "name": "Old checking name"},
+            {"id": "acct_first", "displayName": "Example checking"},
+            {"id": "acct_second", "displayName": "Example savings"},
+            {"id": "acct_legacy", "name": "Legacy account"},
+            {"id": "acct_fallback", "displayName": "", "name": "Fallback account"},
+            {"id": "acct_unknown"},
+        ]
+        transactions = [{**transaction(-5), "account": account} for account in accounts]
+        mock_reads(mock_api, transactions, len(transactions))
+        names = {"Example checking", "Example savings", "Legacy account", "Fallback account", "Unknown"}
+        summary = await server.get_spending_summary(group_by="account")
+        assert set(summary.groups) == names
+        assert summary.groups["Example checking"].expenses == 10
+        patterns = await server.analyze_spending_patterns(include_forecasting=False)
+        assert isinstance(patterns.account_usage, dict)
+        assert set(patterns.account_usage) == names
+        assert patterns.account_usage["Example checking"] == {"total_volume": 10, "transactions": 2}
+        overview = await server.get_complete_financial_overview()
+        assert isinstance(overview.transaction_summary, dict)
+        assert overview.transaction_summary["unique_accounts"] == len(names)
 
 
 class TestInvalidAmounts:
